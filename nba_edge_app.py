@@ -3,8 +3,17 @@ import pandas as pd
 import numpy as np
 import requests
 import datetime
+import os
+import re
 from zoneinfo import ZoneInfo
 from sqlalchemy import create_engine, text
+import pdfplumber
+
+from openai import OpenAI  # <- keep just this import
+
+# Create OpenAI client (reads OPENAI_API_KEY from environment)
+client = OpenAI()
+
 
 # =========================
 # CONFIG
@@ -153,6 +162,26 @@ with engine.connect() as conn:
         if cc not in col_names:
             conn.execute(text(f"ALTER TABLE logs ADD COLUMN {cc} REAL"))
             
+    if "ctg_notes" not in col_names:
+        conn.execute(text("ALTER TABLE logs ADD COLUMN ctg_notes TEXT"))
+    if "ctg_reason" not in col_names:
+        conn.execute(text("ALTER TABLE logs ADD COLUMN ctg_reason TEXT"))
+    if "ctg_summary" not in col_names:
+        conn.execute(text("ALTER TABLE logs ADD COLUMN ctg_summary TEXT"))
+
+# =========================
+# Log loading helper
+# =========================
+@st.cache_data
+def load_all_logs() -> pd.DataFrame:
+    """Central place to read the logs table.
+
+    Both Prediction Log and Slate View should call this so they stay in sync.
+    """
+    with engine.connect() as conn:
+        return pd.read_sql("SELECT * FROM logs ORDER BY id", conn)
+
+            
 # =========================
 # Data Load
 # =========================
@@ -259,114 +288,219 @@ def full_to_abbr(name: str) -> str:
     
 def load_cheatsheet_from_scoreboard(file):
     """
-    Read the 'SCOREBOARD' tab where:
-      - Column B = team abbr (away on top row, home underneath)
-      - Column AC = projected score for that team
-    We turn this into a clean DataFrame with:
-      away_abbr, home_abbr, proj_away, proj_home
-    """
-    # Try SCOREBOARD sheet by name; fall back to first sheet if needed
-    try:
-        raw = pd.read_excel(file, sheet_name="SCOREBOARD", header=None)
-    except ValueError:
-        raw = pd.read_excel(file, sheet_name=0, header=None)
+    Parse your SCOREBOARD tab in the cheatsheet Excel file.
 
-    team_col_idx = 1   # column B
-    proj_col_idx = 28  # column AC (0-based index)
+    Assumptions (matching your sheet):
+    - Column B = team names (away row, then home row)
+    - Column AC = projected scores
+    - Games are in away/home pairs, but there may be blank spacer rows.
+    """
+    try:
+        # Read the SCOREBOARD sheet
+        raw = pd.read_excel(file, sheet_name="SCOREBOARD", header=0)
+    except Exception as e:
+        st.error(f"Error reading cheatsheet: {e}")
+        return None
+
+    # Column B is index 1, AC is index 28  (A=0, B=1, ..., AC=28)
+    team_col = raw.columns[1]
+    proj_col = raw.columns[28]
 
     rows = []
-    for i in range(len(raw)):
-        # Team cell
-        team = raw.iat[i, team_col_idx] if team_col_idx < raw.shape[1] else None
-        # Projected score cell
-        proj = raw.iat[i, proj_col_idx] if proj_col_idx < raw.shape[1] else None
+    i = 0
+    n = len(raw)
 
-        if isinstance(team, str):
-            team_str = team.strip().upper()
-        else:
-            team_str = None
+    while i + 1 < n:
+        team1 = raw.iloc[i][team_col]
+        team2 = raw.iloc[i + 1][team_col]
+        proj1 = raw.iloc[i][proj_col]
+        proj2 = raw.iloc[i + 1][proj_col]
 
-        if not team_str:
+        # If this pair isn't a clean away/home game, skip down 1 row and keep scanning
+        if pd.isna(team1) or pd.isna(team2) or pd.isna(proj1) or pd.isna(proj2):
+            i += 1
             continue
 
-        # Filter out non-team garbage (e.g., "GAME 1", headers, etc.)
-        if len(team_str) > 4:
-            continue
+        away_full = str(team1).strip()
+        home_full = str(team2).strip()
 
-        # Need a numeric projected score
+        away_abbr = full_to_abbr(away_full)
+        home_abbr = full_to_abbr(home_full)
+
         try:
-            proj_val = float(proj)
-        except (TypeError, ValueError):
+            proj_away = float(proj1)
+            proj_home = float(proj2)
+        except Exception:
+            i += 1
             continue
 
-        rows.append({"team": team_str, "proj": proj_val})
-
-    # Group into pairs: first row = AWAY, second row = HOME
-    games = []
-    pending = None
-    for r in rows:
-        if pending is None:
-            pending = r
+        # Decide favorite / dog from projections
+        if proj_home > proj_away:
+            fav_abbr, dog_abbr = home_abbr, away_abbr
+        elif proj_away > proj_home:
+            fav_abbr, dog_abbr = away_abbr, home_abbr
         else:
-            away = pending
-            home = r
-            games.append(
-                {
-                    "away_abbr": away["team"],
-                    "home_abbr": home["team"],
-                    "proj_away": away["proj"],
-                    "proj_home": home["proj"],
-                }
-            )
-            pending = None
+            fav_abbr, dog_abbr = home_abbr, away_abbr
 
-    return pd.DataFrame(games)
+        pair_key = "|".join(sorted([away_abbr, home_abbr]))
+
+        rows.append(
+            {
+                "away_abbr": away_abbr,
+                "home_abbr": home_abbr,
+                "proj_away": proj_away,
+                "proj_home": proj_home,
+                "fav_abbr": fav_abbr,
+                "dog_abbr": dog_abbr,
+                "pair_key": pair_key,
+            }
+        )
+
+        i += 2
+
+    if not rows:
+        st.warning("Cheatsheet parsed 0 games from SCOREBOARD.")
+        return None
+
+    df = pd.DataFrame(rows)
+    st.caption(f"Cheatsheet parsed {len(df)} games from SCOREBOARD.")
+    return df
+
 
 
 def lookup_cheatsheet_projection_for_game(
-    cheatsheet_df: pd.DataFrame,
-    home_abbr: str,
-    away_abbr: str,
-    favorite_abbr: str,
-    underdog_abbr: str,
+    cheatsheet_df, favorite_abbr, underdog_abbr, home_abbr, away_abbr
 ):
-    """
-    Given:
-      - cheatsheet_df with cols: away_abbr, home_abbr, proj_away, proj_home
-      - home_abbr / away_abbr from Odds API / manual entry
-      - favorite_abbr / underdog_abbr from the current game
-    Return (proj_fav, proj_dog) according to who is favorite.
-    """
-    required_cols = {"away_abbr", "home_abbr", "proj_away", "proj_home"}
-    if not required_cols.issubset(cheatsheet_df.columns) or cheatsheet_df.empty:
-        # Cheatsheet not parsed correctly or no games detected
-        return None, None
+    if cheatsheet_df is None:
+        return None, None, None
 
-    home_abbr = home_abbr.upper()
-    away_abbr = away_abbr.upper()
-    favorite_abbr = favorite_abbr.upper()
-    underdog_abbr = underdog_abbr.upper()
+    fav = favorite_abbr.upper()
+    dog = underdog_abbr.upper()
+    home = home_abbr.upper()
+    away = away_abbr.upper()
 
-    sub = cheatsheet_df[
-        (cheatsheet_df["home_abbr"].str.upper() == home_abbr)
-        & (cheatsheet_df["away_abbr"].str.upper() == away_abbr)
-    ]
+    # Normalized pair key for this game
+    pair_key = "|".join(sorted([home, away]))
 
-    if sub.empty:
-        return None, None
+    # 1) match by pair_key only (ignore fav/home-away quirks)
+    mask = cheatsheet_df["pair_key"].str.upper() == pair_key
+    if not mask.any():
+        return None, None, None
 
-    row = sub.iloc[0]
-    proj_home = float(row["proj_home"])
-    proj_away = float(row["proj_away"])
+    row = cheatsheet_df[mask].iloc[0]
 
-    if favorite_abbr == home_abbr:
-        proj_fav = proj_home
-        proj_dog = proj_away
+    proj_home = row["proj_home"]
+    proj_away = row["proj_away"]
+
+    # Return projections in fav/dog order
+    if fav == home:
+        proj_fav, proj_dog = proj_home, proj_away
     else:
-        proj_fav = proj_away
-        proj_dog = proj_home
+        proj_fav, proj_dog = proj_away, proj_home
 
     return proj_fav, proj_dog
+
+def extract_text_from_pdf(file) -> str:
+    """Extract raw text from an uploaded PDF file."""
+    if file is None:
+        return ""
+    try:
+        text_chunks = []
+        with pdfplumber.open(file) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text() or ""
+                text_chunks.append(t)
+        return "\n\n".join(text_chunks)
+    except Exception as e:
+        st.error(f"Error reading PDF: {e}")
+        return ""
+
+def analyze_game_with_ctg(game_row, ctg_text: str) -> tuple[str, str]:
+    """
+    Use OpenAI to classify why a pick covered / didn't cover,
+    based on your model info + CTG postgame writeup.
+    Returns (reason_label, summary_text).
+    """
+    # If client isn't set up, bail out cleanly
+
+    if not ctg_text.strip():
+        return "", "No CTG text available."
+
+    fav = str(game_row["favorite"])
+    dog = str(game_row["underdog"])
+    pick = str(game_row.get("pick", ""))
+    edge = game_row.get("edge", None)
+    conf = str(game_row.get("confidence", ""))
+    final_score = str(game_row.get("final_score", ""))
+    cov = game_row.get("spread_covered", None)
+
+    outcome_text = "unknown"
+    if cov == 1:
+        outcome_text = "your pick covered the spread"
+    elif cov == 0:
+        outcome_text = "your pick did NOT cover the spread"
+
+    system_prompt = (
+        "You are helping analyze NBA bets using post-game reports.\n"
+        "Given a model's pre-game pick, edge, and outcome, plus a detailed "
+        "post-game report, decide whether the model's logic was vindicated "
+        "or not, and if not, what the main reason was.\n\n"
+        "Choose ONE primary reason label from this list:\n"
+        "- shooting_variance\n"
+        "- defense_matchup\n"
+        "- turnovers\n"
+        "- rebounding\n"
+        "- fouls_free_throws\n"
+        "- injuries_rotations\n"
+        "- garbage_time\n"
+        "- model_miss\n"
+        "- other\n\n"
+        "Be conservative: only call it model_miss if the report suggests "
+        "the underlying assumptions were wrong, not just variance."
+    )
+
+    # Guard against edge being None so we don't crash on formatting
+    edge_str = f"{edge:.2f}" if edge is not None else "N/A"
+
+    user_prompt = f"""
+Game: {fav} vs {dog}
+Pick: {pick}
+Model edge: {edge_str} (confidence: {conf})
+Outcome: {outcome_text}
+Final score: {final_score}
+
+Post-game report text (CTG):
+\"\"\"
+{ctg_text[:8000]}
+\"\"\"
+
+1. Did the game fundamentally play out in line with the model's logic (yes/no)?
+2. If the pick missed, what is the MAIN reason, using ONE label from the list?
+3. Provide a brief 2-3 sentence explanation referencing the report.
+Return a JSON object with keys: "reason", "summary".
+"""
+
+    resp = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.3,
+    )
+
+    import json
+    try:
+        data = json.loads(resp.choices[0].message.content)
+        reason = (data.get("reason") or "").strip()
+        summary = (data.get("summary") or "").strip()
+    except Exception:
+        reason = ""
+        summary = resp.choices[0].message.content.strip()
+
+    return reason, summary
+
 
 
 
@@ -700,7 +834,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_single, tab_logs = st.tabs(["Single Game", "Prediction Log"])
+tab_single, tab_slate, tab_logs = st.tabs(["Single Game","Slate View", "Prediction Log"])
 
 # ============================================
 # SINGLE GAME ANALYZER
@@ -746,28 +880,54 @@ with tab_single:
             f"Status: **{game_status}** — {away_full} @ {home_full}, "
             f"line: {favorite_abbr} {vegas_line:.1f}"
         )
+        
+    # =========================
+    # Cheatsheet Import (Optional)
+    # =========================
+    with st.expander("Cheatsheet Import (Optional)", expanded=False):
+        uploaded_cheatsheet = st.file_uploader(
+            "Upload cheatsheet Excel (SCOREBOARD tab)",
+            type=["xlsx", "xls"],
+            key="cheatsheet_upload",
+        )
+
+        # Load / persist cheatsheet_df in session_state
+        if uploaded_cheatsheet is not None:
+            cheatsheet_df = load_cheatsheet_from_scoreboard(uploaded_cheatsheet)
+            st.session_state["cheatsheet_df"] = cheatsheet_df
+        else:
+            cheatsheet_df = st.session_state.get("cheatsheet_df")
+
+        if cheatsheet_df is not None:
+            st.caption(
+                f"Cheatsheet loaded from SCOREBOARD tab for {len(cheatsheet_df)} games "
+                "(away/home + projections)."
+            )
+            st.dataframe(
+                cheatsheet_df[
+                    [
+                        "away_abbr",
+                        "home_abbr",
+                        "proj_away",
+                        "proj_home",
+                        "fav_abbr",
+                        "dog_abbr",
+                        "pair_key",
+                    ]
+                ],
+                use_container_width=True,
+            )
+        else:
+            st.caption("No cheatsheet loaded yet.")
+    
 
     # Situational flags (Back-to-Back)
-    st.subheader("Situational Flags (B2B + Schedule)")
+    st.subheader("Situational Flags (B2B)")
     col_flag1, col_flag2 = st.columns(2)
     with col_flag1:
-         b2b_home = st.checkbox(f"{home_abbr} B2B", value=False)
-         home_games_last5 = st.number_input(
-             f"{home_abbr} games last 5 days",
-             min_value=0,
-             max_value=5,
-             value=2,
-             step=1,
-         )
+        b2b_home = st.checkbox(f"{home_abbr} B2B", value=False)
     with col_flag2:
-         b2b_away = st.checkbox(f"{away_abbr} B2B", value=False)
-         away_games_last5 = st.number_input(
-             f"{away_abbr} games last 5 days",
-             min_value=0,
-             max_value=5,
-             value=2,
-             step=1,
-         )
+        b2b_away = st.checkbox(f"{away_abbr} B2B", value=False)
 
     st.subheader("Spread + Score Inputs")
 
@@ -780,107 +940,92 @@ with tab_single:
         vegas_line = st.number_input(
             "Vegas Spread (favorite only)", step=0.5, value=float(vegas_line)
         )
-        
+
     # =========================
-    # Cheatsheet Import (Optional)
+    # Cheatsheet hook for THIS game + Stat model inputs
     # =========================
-    st.subheader("Cheatsheet Import (Optional)")
-
-    uploaded_cheatsheet = st.file_uploader(
-        "Upload cheatsheet Excel (SCOREBOARD tab)",
-        type=["xlsx"],
-        key="cheatsheet_upload",
-    )
-
-    if uploaded_cheatsheet is not None:
-        try:
-            cheatsheet_games = load_cheatsheet_from_scoreboard(uploaded_cheatsheet)
-            st.session_state["cheatsheet_df"] = cheatsheet_games
-            st.caption(
-                f"Cheatsheet loaded from SCOREBOARD tab "
-                f"for {len(cheatsheet_games)} games (away/home + projections)."
-            )
-            # Optional preview
-            st.dataframe(cheatsheet_games.head(), use_container_width=True)
-        except Exception as e:
-            st.error(f"Error reading cheatsheet: {e}") 
-
-    # Try to pull projections for this specific game from the loaded cheatsheet
-    cheat_pf = cheat_pd = None
     cheatsheet_df = st.session_state.get("cheatsheet_df")
+    cheat_pf, cheat_pd = None, None
 
     if cheatsheet_df is not None:
-        cheat_pf, cheat_pd = lookup_cheatsheet_projection_for_game(
-            cheatsheet_df,
-            home_abbr=home_abbr,
-            away_abbr=away_abbr,
-            favorite_abbr=favorite,
-            underdog_abbr=underdog,
-        )
-
-    if (cheat_pf is not None) and (cheat_pd is not None):
-        st.info(
-            f"Cheatsheet projections found: {favorite} {cheat_pf:.1f} — "
-            f"{underdog} {cheat_pd:.1f}"
-        )
-        if st.button("Use cheatsheet projections", key="use_cheatsheet_proj"):
-            st.session_state["proj_fav"] = float(cheat_pf)
-            st.session_state["proj_dog"] = float(cheat_pd)        
+        try:
+            cheat_pf, cheat_pd = lookup_cheatsheet_projection_for_game(
+                cheatsheet_df=cheatsheet_df,
+                favorite_abbr=favorite,
+                underdog_abbr=underdog,
+                home_abbr=home_abbr,
+                away_abbr=away_abbr,
+            )
+        except Exception as e:
+            st.caption(f"Cheatsheet lookup error: {e}")
 
     st.subheader("Projected Scores (Stat Model)")
 
-    # Favorite
-    if "proj_fav" in st.session_state:
-        proj_fav = st.number_input(
-            f"Projected Score ({favorite})",
-            step=1.0,
-            key="proj_fav",
-        )
-    else:
-        proj_fav = st.number_input(
-            f"Projected Score ({favorite})",
-            step=1.0,
-            value=110.0,
-            key="proj_fav",
+    # Initialize state once
+    if "proj_fav_input" not in st.session_state:
+        st.session_state["proj_fav_input"] = 110.0
+    if "proj_dog_input" not in st.session_state:
+        st.session_state["proj_dog_input"] = 104.0
+
+    # If cheatsheet projections exist, show them and enable button
+    if (cheat_pf is not None) and (cheat_pd is not None):
+        st.info(
+            f"Cheatsheet projections found: "
+            f"{favorite.upper()} {cheat_pf:.1f} — "
+            f"{underdog.upper()} {cheat_pd:.1f}"
         )
 
-    # Underdog
-    if "proj_dog" in st.session_state:
-        proj_dog = st.number_input(
-            f"Projected Score ({underdog})",
-            step=1.0,
-            key="proj_dog",
-        )
+        if st.button("Use cheatsheet projections", key="use_cheatsheet_proj"):
+            st.session_state["proj_fav_input"] = float(cheat_pf)
+            st.session_state["proj_dog_input"] = float(cheat_pd)
+            st.rerun()
     else:
-        proj_dog = st.number_input(
-            f"Projected Score ({underdog})",
-            step=1.0,
-            value=104.0,
-            key="proj_dog",
-        )
+        st.caption("No matching cheatsheet row for this game.")
+
+    # Now render the inputs, which read from session_state
+    proj_fav = st.number_input(
+        f"Projected Score ({favorite.upper()})",
+        step=1.0,
+        key="proj_fav_input",
+    )
+    proj_dog = st.number_input(
+        f"Projected Score ({underdog.upper()})",
+        step=1.0,
+        key="proj_dog_input",
+    )
 
     st.subheader("Player Availability (On/Off Impact)")
 
-    # Filter player list to exclude long-term absences
-    home_players_df = players_df[players_df["Team"] == home_abbr].copy()
-    away_players_df = players_df[players_df["Team"] == away_abbr].copy()
-
-    if "DaysSinceLastGame" in home_players_df.columns:
-        mask_home = (
-            home_players_df["DaysSinceLastGame"].isna()
-            | (home_players_df["DaysSinceLastGame"] <= MAX_DAYS_ABSENT)
+    col_filter1, col_filter2 = st.columns(2)
+    with col_filter1:
+        hide_long_out = st.checkbox("Hide long-term out players", value=True)
+    with col_filter2:
+        max_days_out = st.number_input(
+            "Max days since last game to show",
+            min_value=1,
+            max_value=90,
+            value=21,
+            step=1,
         )
-        home_players_df = home_players_df[mask_home]
 
-    if "DaysSinceLastGame" in away_players_df.columns:
-        mask_away = (
-            away_players_df["DaysSinceLastGame"].isna()
-            | (away_players_df["DaysSinceLastGame"] <= MAX_DAYS_ABSENT)
-        )
-        away_players_df = away_players_df[mask_away]
+    def get_player_pool(team_abbr: str):
+        team_df = players_df[players_df["Team"] == team_abbr]
+        long_out_names = []
 
-    home_players = home_players_df["Player"].unique()
-    away_players = away_players_df["Player"].unique()
+        if hide_long_out and "DaysSinceLastGame" in team_df.columns:
+            mask_long = (
+                team_df["DaysSinceLastGame"].notna()
+                & (team_df["DaysSinceLastGame"] > max_days_out)
+            )
+            long_out_names = (
+                team_df.loc[mask_long, "Player"].dropna().unique().tolist()
+            )
+            team_df = team_df.loc[~mask_long]
+
+        return team_df["Player"].dropna().unique().tolist(), long_out_names
+
+    home_players, home_long_out = get_player_pool(home_abbr)
+    away_players, away_long_out = get_player_pool(away_abbr)
 
     home_out, away_out = [], []
     colH, colA2 = st.columns(2)
@@ -890,22 +1035,35 @@ with tab_single:
         for i in range(5):
             choice = st.selectbox(
                 f"Out Player {i+1}",
-                ["None"] + list(home_players),
+                ["None"] + home_players,
                 key=f"home_out_{i}",
             )
             if choice != "None":
                 home_out.append(choice)
+
+        if hide_long_out and home_long_out:
+            st.caption(
+                "Long-term out (hidden): "
+                + ", ".join(sorted(home_long_out))
+            )
 
     with colA2:
         st.markdown(f"**Away Out: {away_abbr}**")
         for i in range(5):
             choice = st.selectbox(
                 f"Out Player {i+1}",
-                ["None"] + list(away_players),
+                ["None"] + away_players,
                 key=f"away_out_{i}",
             )
             if choice != "None":
                 away_out.append(choice)
+
+        if hide_long_out and away_long_out:
+            st.caption(
+                "Long-term out (hidden): "
+                + ", ".join(sorted(away_long_out))
+            )
+
 
     # --- Compute + Model Logic ---
     compute_btn = st.button("Compute Edge")
@@ -1286,7 +1444,7 @@ with tab_single:
             unsafe_allow_html=True,
         )
 
-        # Log button (only here, only in Single Game tab)
+        # --- Log this pick into DB ---
         if st.button("💾 Log This Pick"):
             logged_pick = pick_to_log
 
@@ -1315,8 +1473,7 @@ with tab_single:
                         "cheat_pick": cheat_pick,
                         "models_aligned": 1 if aligned else 0,
                         "hybrid_pick": hybrid_pick,
-                        
-                        # NEW: components for weight learning
+                        # components for weight learning
                         "stat_margin": st.session_state.get("stat_margin"),
                         "team_margin": st.session_state.get("fav_team_margin_combined"),
                         "player_adj_eff": st.session_state.get("effective_player_adj"),
@@ -1333,11 +1490,264 @@ with tab_single:
             with engine.begin() as conn:
                 entry.to_sql("logs", conn, if_exists="append", index=False)
 
+            # Clear cached logs so Slate + Prediction Log see the new row
+            load_all_logs.clear()
+
             st.success("Logged!")
             st.session_state["has_decision"] = False
             st.session_state["decision_logged"] = True
             st.rerun()
 
+# ============================================
+# SLATE VIEW / DAILY REVIEW
+# ============================================
+with tab_slate:
+    st.subheader("Slate View & Daily Review")
+
+    # --- CTG PDF upload (one or more files) ---
+    st.markdown("### CTG Postgame Reports (Optional)")
+    ctg_pdfs = st.file_uploader(
+        "Upload CTG PDFs for this slate (e.g. '11_25_25 ORL @ PHI')",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="ctg_pdf_upload",
+    )
+
+    # ctg_docs maps: (date, frozenset({TEAM1, TEAM2})) -> {"text": str, "name": filename}
+    ctg_docs = st.session_state.get("ctg_docs", {})
+
+    if ctg_pdfs:
+        pattern = re.compile(r"(\d{2}_\d{2}_\d{2})\s+([A-Za-z]{2,4})\s+@\s+([A-Za-z]{2,4})")
+
+        for uploaded in ctg_pdfs:
+            base = os.path.splitext(uploaded.name)[0]
+            try:
+                # Allow extra text before/after, just find "MM_DD_YY ORL @ PHI" anywhere
+                m = pattern.search(base)
+                if not m:
+                    raise ValueError("Could not find 'MM_DD_YY TEAM @ TEAM' pattern")
+
+                date_part = m.group(1)      # "11_25_25"
+                away_abbr = m.group(2).upper()
+                home_abbr = m.group(3).upper()
+
+                month_s, day_s, year_s = date_part.split("_")
+                month = int(month_s)
+                day = int(day_s)
+                yy = int(year_s)
+                year = 2000 + yy if yy < 100 else yy
+
+                game_date = datetime.date(year, month, day)
+
+                key = (game_date, frozenset({away_abbr, home_abbr}))
+
+                text = extract_text_from_pdf(uploaded)
+                if text.strip():
+                    ctg_docs[key] = {
+                        "text": text,
+                        "name": uploaded.name,
+                    }
+                    st.success(
+                        f"Linked CTG PDF '{uploaded.name}' to "
+                        f"{away_abbr} @ {home_abbr} on {game_date}."
+                    )
+                else:
+                    st.warning(f"No text found in '{uploaded.name}'.")
+            except Exception as e:
+                st.warning(
+                    f"Could not parse CTG filename '{uploaded.name}'. Expected something containing "
+                    f"'MM_DD_YY ORL @ PHI'. Error: {e}"
+                )
+
+        # persist mapping in session
+        st.session_state["ctg_docs"] = ctg_docs
+
+        
+    try:
+        all_logs = load_all_logs()  
+    except Exception as e:
+        st.warning(f"Error reading logs: {e}")
+        all_logs = pd.DataFrame()
+
+    if all_logs.empty:
+        st.info("No logged picks yet.")
+    else:
+        today = datetime.date.today()
+        yesterday = today - datetime.timedelta(days=1)
+
+        st.markdown("### CTG Review Date")
+
+        review_date = st.date_input(
+            "Date to review alongside Cleaning The Glass reports",
+            value=yesterday,
+            max_value=today,
+        )
+
+        review_str = review_date.strftime("%Y-%m-%d")
+        review_logs = all_logs[all_logs["date"] == review_str]
+
+        # Friendly Spread Covered label
+        if "spread_covered" in review_logs.columns:
+            review_logs = review_logs.copy()
+            review_logs["Spread Covered"] = review_logs["spread_covered"].map(
+                {1: "✅ Covered", 0: "❌ Missed"}
+            )
+        else:
+            review_logs["Spread Covered"] = ""
+
+        st.markdown(f"#### Logged picks for {review_str}")
+        if review_logs.empty:
+            st.info("No picks logged for this date.")
+        else:
+            # Show compact table for quick scan while reading CTG
+            cols_to_show = [
+                c for c in [
+                    "favorite",
+                    "underdog",
+                    "vegas_line",
+                    "edge",
+                    "pick",
+                    "confidence",
+                    "final_score",
+                    "Spread Covered",
+                ] if c in review_logs.columns
+            ]
+            st.dataframe(review_logs[cols_to_show], use_container_width=True)
+
+            # Optional: per-game expanders with more context
+            st.markdown("##### Per-game breakdown")
+    for _, row in review_logs.iterrows():
+        fav = str(row["favorite"]).upper()
+        dog = str(row["underdog"]).upper()
+        date_str = str(row["date"])
+        edge = row.get("edge", None)
+        conf = row.get("confidence", "")
+        pick = row.get("pick", "")
+        fs = row.get("final_score", None)
+        cov = row.get("spread_covered", None)
+
+        title = f"{date_str} — {fav} vs {dog} | Pick: {pick}"
+        if edge is not None:
+            title += f" (Edge {edge:.2f}, {conf})"
+
+        with st.expander(title):
+            st.write(f"**Pick:** {pick}")
+            st.write(f"**Vegas line at time:** {row['vegas_line']:+.1f}")
+            if edge is not None:
+                st.write(f"**Model edge (hybrid):** {edge:.2f} pts")
+            st.write(f"**Confidence:** {conf}")
+
+            if fs:
+                if cov == 1:
+                    st.markdown(f"**Result:** ✅ Covered — Final score: {fs}")
+                elif cov == 0:
+                    st.markdown(f"**Result:** ❌ Missed — Final score: {fs}")
+                else:
+                    st.markdown(f"**Result:** Final score: {fs}")
+            else:
+                st.markdown("**Result:** Final score not logged yet.")
+
+            # --- CTG-based auto analysis only (no manual notes) ---
+
+            # Build key for this game (date + team pair)
+            try:
+                row_date = datetime.date.fromisoformat(date_str)
+            except Exception:
+                row_date = None
+
+            ctg_entry = None
+            if row_date is not None:
+                game_key = (row_date, frozenset({fav, dog}))
+                ctg_entry = ctg_docs.get(game_key)
+
+            if ctg_entry:
+                ctg_text_for_row = ctg_entry["text"]
+                source_name = ctg_entry["name"]
+                st.markdown(f"_CTG PDF linked_: `{source_name}`")
+
+                existing_reason = row.get("ctg_reason") or ""
+                existing_summary = row.get("ctg_summary") or ""
+
+                if existing_reason or existing_summary:
+                    st.write(f"_Last saved reason_: `{existing_reason}`")
+                    if existing_summary:
+                        st.write(existing_summary)
+
+                if st.button(
+                    "Analyze with CTG",
+                    key=f"analyze_ctg_{int(row['id'])}",
+                ):
+                    reason, summary = analyze_game_with_ctg(row, ctg_text_for_row)
+                    if reason or summary:
+                        with engine.begin() as conn2:
+                            conn2.execute(
+                                text(
+                                    """
+                                    UPDATE logs
+                                    SET ctg_reason = :reason,
+                                        ctg_summary = :summary
+                                    WHERE id = :id
+                                    """
+                                ),
+                                {
+                                    "reason": reason,
+                                    "summary": summary,
+                                    "id": int(row["id"]),
+                                },
+                            )
+                        st.success("CTG analysis saved.")
+                        st.write(f"_Latest reason_: `{reason}`")
+                        if summary:
+                            st.write(summary)
+                    else:
+                        st.warning("Could not derive a CTG-based reason.")
+            else:
+                st.caption(
+                    "No CTG PDF linked for this matchup. "
+                    "Upload a file named like 'MM_DD_YY ORL @ PHI' that matches this date and teams."
+                )
+
+                    
+
+    # 👇 DEDENTED: runs once per date, not per row
+    # Quick export for CTG day if you want it in Excel
+    csv_bytes = review_logs.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download this date's picks as CSV",
+         data=csv_bytes,
+         file_name=f"nba_edge_picks_{review_str}.csv",
+         mime="text/csv",
+         key=f"download_logs_csv_{review_str}",
+    )
+
+    st.markdown("### Today's Logged Picks")
+
+    today_str = today.strftime("%Y-%m-%d")
+    today_logs = all_logs[all_logs["date"] == today_str]
+
+    if today_logs.empty:
+        st.info("No picks logged yet today.")
+    else:
+            if "spread_covered" in today_logs.columns:
+                today_logs = today_logs.copy()
+                today_logs["Spread Covered"] = today_logs["spread_covered"].map(
+                    {1: "✅ Covered", 0: "❌ Missed"}
+                )
+            else:
+                today_logs["Spread Covered"] = ""
+
+            cols_to_show_today = [
+                c for c in [
+                    "favorite",
+                    "underdog",
+                    "vegas_line",
+                    "edge",
+                    "pick",
+                    "confidence",
+                    "Spread Covered",
+                ] if c in today_logs.columns
+            ]
+            st.dataframe(today_logs[cols_to_show_today], use_container_width=True)
 
 
 
@@ -1356,10 +1766,14 @@ with tab_logs:
     with col_btn2:
         if st.button("🗑️ Delete Last Logged Pick"):
             with engine.begin() as conn:
-                conn.execute(text(
-                    "DELETE FROM logs WHERE id = (SELECT MAX(id) FROM logs)"
-                ))
-            st.success("Last logged pick deleted.")
+                conn.execute(
+                    text(
+                        "DELETE FROM logs WHERE id = (SELECT MAX(id) FROM logs)"
+                    )
+                )
+            # Clear cached logs so Single Game / Slate / Prediction Log all reload fresh
+            load_all_logs.clear()
+            st.success("Deleted last logged pick.")
             st.rerun()
 
     #with col_btn3:
@@ -1370,7 +1784,7 @@ with tab_logs:
          #   st.rerun()
 
     try:
-        logs = pd.read_sql("SELECT * FROM logs ORDER BY id DESC", engine)
+        logs = load_all_logs().sort_values("id", ascending=False).reset_index(drop=True)
         if logs.empty:
             st.info("No logs yet.")
         else:
@@ -1412,6 +1826,9 @@ with tab_logs:
                 "hybrid_margin",
                 "effective_edge",
                 "model_line",
+                "ctg_notes",
+                "ctg_reason",
+                "ctg_summary",
             ]:
                 if col in display_logs.columns:
                     display_logs = display_logs.drop(columns=[col])

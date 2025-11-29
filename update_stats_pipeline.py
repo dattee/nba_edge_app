@@ -1,9 +1,11 @@
-
+import numpy as np
+import unicodedata
+import re
 import datetime
 import time
 from dataclasses import dataclass
 from typing import Optional, Dict
-
+from nba_api.stats.endpoints import commonallplayers, playergamelog
 import pandas as pd
 
 # This script uses the `nba_api` package:
@@ -87,48 +89,79 @@ def fetch_team_advanced_stats(season: str) -> pd.DataFrame:
     cols = [c for c in cols if c in df.columns]
 
     return df[cols].copy()
+    
+# Map CSV names -> canonical names when they genuinely differ.
+# Example: your CSV might say "Cameron Thomas" but NBA uses "Cam Thomas".
+NAME_ALIASES = {
+    "cameron thomas": "cam thomas",
+    "nicolas claxton": "nic claxton",
+    "nick claxton": "nic claxton",  # in case you ever type it this way
+    # add more if you see mismatches
+    
+}
 
 
-def build_player_lookup() -> Dict[str, dict]:
-    """Build a lookup from UPPERCASE full name to player dict (from nba_api)."""
-    from nba_api.stats.static import players
+def normalize_name(name: str) -> str:
+    """
+    Normalize player names so CSV names like 'Luka Doncic' match
+    API names like 'Luka Dončić' or 'Jaren Jackson Jr.'.
+    Also applies manual aliases (e.g. 'Cameron Thomas' -> 'Cam Thomas').
+    """
+    if not isinstance(name, str):
+        return ""
 
-    all_players = players.get_players()
-    lookup: Dict[str, dict] = {}
+    # 1) strip accents
+    name = unicodedata.normalize("NFKD", name)
+    name = "".join(c for c in name if not unicodedata.combining(c))
+
+    # 2) remove punctuation we don't care about
+    name = name.replace(".", "")
+    name = name.replace("'", "")
+    name = name.replace("-", " ")
+
+    # 3) remove common suffixes like Jr, Sr, II, III, IV
+    name = re.sub(r"\s+\b(jr|sr|ii|iii|iv)\b\.?", "", name, flags=re.IGNORECASE)
+
+    # 4) normalize whitespace + lowercase
+    name = re.sub(r"\s+", " ", name).strip().lower()
+
+    # 5) apply alias map (e.g. "cameron thomas" -> "cam thomas")
+    if name in NAME_ALIASES:
+        name = NAME_ALIASES[name]
+
+    return name
+
+
+def build_player_lookup() -> Dict[str, int]:
+    """
+    Build a lookup from NORMALIZED name -> NBA player id using nba_api.
+    This handles accents, Jr., punctuation, and alias names.
+    """
+    from nba_api.stats.static import players as nba_players
+
+    all_players = nba_players.get_players()
+    lookup: Dict[str, int] = {}
+
     for p in all_players:
-        name_key = p["full_name"].upper().strip()
-        # In case of duplicates, just keep the first one
-        lookup.setdefault(name_key, p)
+        full_name = p.get("full_name") or ""
+        key = normalize_name(full_name)
+        if not key:
+            continue
+        # keep first if duplicates
+        lookup.setdefault(key, p["id"])
+
     return lookup
 
 
-def find_player_id_by_name(raw_name: str, name_lookup: Dict[str, dict]) -> Optional[int]:
-    """Try to map a name from players_onoff.csv to an nba_api player id.
-
-    This does a few normalizations but is still name-based, so
-    some manual corrections may be needed in your CSV if names
-    don't match how nba_api stores them.
+def find_player_id_by_name(raw_name: str, name_lookup: Dict[str, int]) -> Optional[int]:
     """
-    name = raw_name.upper().strip()
+    Normalize a CSV name and look it up in the NBA player dict.
+    """
+    if not isinstance(raw_name, str):
+        return None
+    key = normalize_name(raw_name)
+    return name_lookup.get(key)
 
-    # Direct lookup first
-    if name in name_lookup:
-        return name_lookup[name]["id"]
-
-    # Try some simple cleanup: remove periods (e.g., "Jr.", initials), double spaces
-    for ch in [".", ","]:
-        name = name.replace(ch, " ")
-    name = " ".join(name.split())
-
-    if name in name_lookup:
-        return name_lookup[name]["id"]
-
-    # As a last resort, try contains-style matches
-    for key, pdata in name_lookup.items():
-        if name in key or key in name:
-            return pdata["id"]
-
-    return None
 
 
 def fetch_player_last_game(player_id: int, season: str) -> Optional[datetime.date]:
@@ -210,64 +243,117 @@ def update_team_ratings(team_ratings_path: str, season: str) -> None:
     tr.to_csv(team_ratings_path, index=False)
 
 
-def update_players_onoff(players_onoff_path: str, season: str) -> None:
-    print(f"Loading players_onoff from {players_onoff_path} ...")
-    df = pd.read_csv(players_onoff_path)
+def update_players_onoff(csv_path: str, season: str):
+    """
+    Update players_onoff.csv with LastGameDate and DaysSinceLastGame
+    using nba_api PlayerGameLog.
 
-    if "Player" not in df.columns or "Team" not in df.columns:
-        raise ValueError("players_onoff.csv must have 'Player' and 'Team' columns.")
+    - Resolves player_id by normalized name (handles accents, Jr, aliases).
+    - If no ID or error: leaves LastGameDate blank and DaysSinceLastGame as NaN.
+    - Skips players that were already updated today (LastUpdateDate == today).
+    """
+    print(f"Loading players_onoff from {csv_path} ...")
+    df = pd.read_csv(csv_path)
+    df["Team"] = df["Team"].str.upper()
 
-    # Prepare new columns
+    # Ensure columns exist
     if "LastGameDate" not in df.columns:
-        df["LastGameDate"] = pd.NA
+        df["LastGameDate"] = ""
     if "DaysSinceLastGame" not in df.columns:
-        df["DaysSinceLastGame"] = pd.NA
+        df["DaysSinceLastGame"] = np.nan
+    if "LastUpdateDate" not in df.columns:
+        df["LastUpdateDate"] = ""  # YYYY-MM-DD string
 
-    # Build player lookup from nba_api
-    print("Building player name lookup ...")
+    # Build normalized name -> id lookup once
+    print("Building player name lookup (normalized) ...")
     name_lookup = build_player_lookup()
 
+    from nba_api.stats.endpoints import playergamelog
+
     today = datetime.date.today()
-    n = len(df)
-    print(f"Processing {n} players ...")
+    today_str = today.isoformat()
 
-    for idx, row in df.iterrows():
-    player_name = str(row["Player"])
+    new_last_dates: list[str] = []
+    new_days_since: list[float] = []
+    new_update_dates: list[str] = []
 
-    # If we already know their last game date, just recompute DaysSinceLastGame locally
-    existing_date = row.get("LastGameDate")
-    if pd.notna(existing_date):
+    print(f"Processing {len(df)} players ...")
+    for _, row in df.iterrows():
+        name = str(row["Player"])
+        last_update = str(row.get("LastUpdateDate", "") or "")
+
+        # --- SKIP if we already updated this row today ---
+        if last_update == today_str:
+            new_last_dates.append(str(row["LastGameDate"] or ""))
+            try:
+                new_days_since.append(float(row["DaysSinceLastGame"]))
+            except Exception:
+                new_days_since.append(np.nan)
+            new_update_dates.append(last_update)
+            print(f"  -> {name}: already updated today, skipping.")
+            continue
+
+        # Resolve player id using normalized names
+        pid = find_player_id_by_name(name, name_lookup)
+
+        if not pid:
+            print(
+                f"  -> no NBA ID found for '{name}' "
+                f"(normalized: '{normalize_name(name)}'), skipping API call."
+            )
+            new_last_dates.append(str(row["LastGameDate"] or ""))
+            try:
+                new_days_since.append(float(row["DaysSinceLastGame"]))
+            except Exception:
+                new_days_since.append(np.nan)
+            new_update_dates.append(last_update)
+            continue
+
         try:
-            last_game = datetime.date.fromisoformat(str(existing_date))
-            df.at[idx, "DaysSinceLastGame"] = (today - last_game).days
-            continue  # skip API call for this player
-        except Exception:
-            # If parsing fails, we'll fall through and try the API fresh
-            pass
+            gl = playergamelog.PlayerGameLog(player_id=pid, season=season)
+            gl_dict = gl.get_normalized_dict()
+            games = gl_dict.get("PlayerGameLog", [])
 
-    # Otherwise, we need to hit the API to discover their last game
-    pid = find_player_id_by_name(player_name, name_lookup)
-    if pid is None:
-        # Could not map this player name
-        continue
+            if not games:
+                print(f"  -> no games logged for '{name}' in {season}.")
+                new_last_dates.append("")
+                new_days_since.append(np.nan)
+                new_update_dates.append(today_str)
+                continue
 
-    last_game = fetch_player_last_game(pid, season)
-    if last_game is None:
-        continue
+            gdf = pd.DataFrame(games)
+            gdf["GAME_DATE"] = pd.to_datetime(gdf["GAME_DATE"])
+            last_date = gdf["GAME_DATE"].max().date()
 
-    df.at[idx, "LastGameDate"] = last_game.isoformat()
-    df.at[idx, "DaysSinceLastGame"] = (today - last_game).days
+            days_since = (today - last_date).days
+            new_last_dates.append(last_date.isoformat())
+            new_days_since.append(float(days_since))
+            new_update_dates.append(today_str)
 
-    if (idx + 1) % 25 == 0 or idx == n - 1:
-        print(f"  -> processed {idx + 1}/{n} players")
+            print(f"  -> {name}: last played {last_date} ({days_since} days ago)")
 
-    backup_path = players_onoff_path.replace(".csv", "_backup.csv")
+        except Exception as e:
+            print(f"  -> error fetching log for '{name}': {e}")
+            new_last_dates.append(str(row["LastGameDate"] or ""))
+            try:
+                new_days_since.append(float(row["DaysSinceLastGame"]))
+            except Exception:
+                new_days_since.append(np.nan)
+            new_update_dates.append(last_update)
+
+    # Write back into the DataFrame
+    df["LastGameDate"] = new_last_dates
+    df["DaysSinceLastGame"] = new_days_since
+    df["LastUpdateDate"] = new_update_dates
+
+    # Backup and save
+    backup_path = csv_path.replace(".csv", "_backup.csv")
     print(f"Saving backup to {backup_path} ...")
     df.to_csv(backup_path, index=False)
 
-    print(f"Writing updated players_onoff to {players_onoff_path} ...")
-    df.to_csv(players_onoff_path, index=False)
-
+    print(f"Writing updated players_onoff to {csv_path} ...")
+    df.to_csv(csv_path, index=False)
+    print("Done updating players_onoff.")
 
 def main():
     _ensure_nba_api()
