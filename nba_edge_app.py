@@ -653,15 +653,28 @@ def fetch_scores(days_from: int = 3):
     """
     Use The Odds API scores endpoint to get final scores
     from the last `days_from` days.
+
+    The Odds API only allows daysFrom up to 3, so we clamp here.
     """
+    # Safety clamp so we never send an invalid value
+    days_from = max(1, min(int(days_from), 3))
+
     params = {
         "apiKey": ODDS_API_KEY,
         "daysFrom": days_from,
     }
     try:
-        r = requests.get(SCORES_API_URL, params=params)
+        r = requests.get(SCORES_API_URL, params=params, timeout=20)
         r.raise_for_status()
         data = r.json()
+    except requests.exceptions.HTTPError as e:
+        # Show both the message and server response (helps debugging)
+        try:
+            msg = r.text
+        except Exception:
+            msg = str(e)
+        st.error(f"Scores API error: {e}\n\nResponse: {msg}")
+        return []
     except Exception as e:
         st.error(f"Scores API error: {e}")
         return []
@@ -714,24 +727,42 @@ def fetch_scores(days_from: int = 3):
     return results
 
 
+
 # =========================
 # Score/Result Updater
 # =========================
-def update_final_scores_from_odds():
-    """Fill in final_score + spread_covered for logged games using Scores API."""
-    games = fetch_scores(days_from=3)
+def update_final_scores_from_odds(days_from: int = 3):
+    """
+    Fill in final_score + spread_covered for logged games using The Odds API scores.
+
+    More forgiving matching:
+    - Look back `days_from` days (default 5)
+    - Match by team pair first, then choose the event with date closest to log date
+    - Don't require `completed=True` as long as scores are present
+    - Print debug info to terminal for each row (matched / not matched)
+    """
+    games = fetch_scores(days_from=days_from)
     if not games:
         st.warning("No scores data available to refresh.")
         return
 
-    # Build lookup by (date, sorted team pair)
-    index = {}
+    # Build index: pair_key -> list of events
+    # pair_key is frozenset of team abbrs, ignoring home/away
+    pair_to_events: dict[frozenset[str], list[dict]] = {}
     for g in games:
-        if not g["commence_dt"]:
-            continue
-        game_date = g["commence_dt"].date()
-        team_pair = tuple(sorted([g["home_abbr"], g["away_abbr"]]))
-        index.setdefault((game_date, team_pair), []).append(g)
+        pair_key = frozenset({g["home_abbr"], g["away_abbr"]})
+        pair_to_events.setdefault(pair_key, []).append(g)
+
+    # For convenience, sort each event list by commence_dt (if available)
+    for evts in pair_to_events.values():
+        evts.sort(
+            key=lambda e: e["commence_dt"]
+            or datetime.datetime.max.replace(tzinfo=ET_TZ)
+        )
+
+    updated_count = 0
+    skipped_no_match = 0
+    skipped_no_scores = 0
 
     with engine.begin() as conn:
         logs_df = pd.read_sql("SELECT * FROM logs", conn)
@@ -740,6 +771,7 @@ def update_final_scores_from_odds():
             try:
                 row_date = datetime.date.fromisoformat(str(row["date"]))
             except Exception:
+                print(f"[refresh] Row id={row['id']} has invalid date '{row['date']}', skipping.")
                 continue
 
             fav = str(row["favorite"]).upper()
@@ -747,66 +779,89 @@ def update_final_scores_from_odds():
             vegas_line = float(row["vegas_line"])
             pick = str(row["pick"])
 
-            key = (row_date, tuple(sorted([fav, dog])))
-            candidates = index.get(key, [])
+            pair_key = frozenset({fav, dog})
+            events = pair_to_events.get(pair_key, [])
 
-            # Try +/- 1 day if nothing at exact date
-            if not candidates:
-                for delta in (-1, 1):
-                    key_alt = (
-                        row_date + datetime.timedelta(days=delta),
-                        tuple(sorted([fav, dog])),
-                    )
-                    if key_alt in index:
-                        candidates = index[key_alt]
-                        break
-
-            if not candidates:
+            if not events:
+                print(f"[refresh] No score events for {fav} vs {dog}, date={row_date}, id={row['id']}")
+                skipped_no_match += 1
                 continue
 
-            # Prefer completed with valid scores
-            event = None
-            for g in candidates:
-                if (
-                    g["completed"]
-                    and g["home_score"] is not None
-                    and g["away_score"] is not None
-                ):
-                    event = g
-                    break
-            if event is None:
+            # Pick event whose game_date is closest to row_date
+            best_event = None
+            best_delta = None
+            for ev in events:
+                if not ev["commence_dt"]:
+                    continue
+                game_date = ev["commence_dt"].date()
+                delta = abs((game_date - row_date).days)
+                if (best_delta is None) or (delta < best_delta):
+                    best_delta = delta
+                    best_event = ev
+
+            if best_event is None:
+                print(f"[refresh] Events found for pair {pair_key}, but no commence_dt, id={row['id']}")
+                skipped_no_match += 1
                 continue
 
-            home_abbr = event["home_abbr"]
-            away_abbr = event["away_abbr"]
-            home_score = int(event["home_score"])
-            away_score = int(event["away_score"])
+            home_abbr = best_event["home_abbr"]
+            away_abbr = best_event["away_abbr"]
+            home_score = best_event["home_score"]
+            away_score = best_event["away_score"]
 
+            if home_score is None or away_score is None:
+                print(
+                    f"[refresh] Event for {fav} vs {dog} has no scores yet "
+                    f"(home_score={home_score}, away_score={away_score}), id={row['id']}"
+                )
+                skipped_no_scores += 1
+                continue
+
+            # Map fav/dog to scores
             if fav == home_abbr:
-                fav_score = home_score
-                dog_score = away_score
+                fav_score = int(home_score)
+                dog_score = int(away_score)
             elif fav == away_abbr:
-                fav_score = away_score
-                dog_score = home_score
+                fav_score = int(away_score)
+                dog_score = int(home_score)
             else:
-                # Teams don't match our fav/dog pair
+                # Teams don't line up the way we expect
+                print(
+                    f"[refresh] Team abbr mismatch for row id={row['id']}: "
+                    f"fav={fav}, dog={dog}, home={home_abbr}, away={away_abbr}"
+                )
+                skipped_no_match += 1
                 continue
 
             margin_fav = fav_score - dog_score
+            line_abs = abs(vegas_line)
 
+            # Determine which team was in the pick string
             parts = pick.split()
             if len(parts) >= 2:
                 pick_team = parts[0].upper()
             else:
                 pick_team = fav
 
-            bet_on_favorite = pick_team == fav
-            line_abs = abs(vegas_line)
+            bet_on_favorite = (pick_team == fav)
 
+            line_abs = abs(vegas_line)
+            eps = 1e-6  # tolerance for float comparisons
+
+            # margin_fav = fav_score - dog_score (already computed above)
+            # For a fav bet: compare margin_fav vs line_abs
+            # For a dog bet: compare line_abs vs margin_fav (dog wants margin_fav smaller)
             if bet_on_favorite:
-                covered = 1 if margin_fav > line_abs else 0
+                diff = margin_fav - line_abs
             else:
-                covered = 1 if margin_fav < line_abs else 0
+                diff = line_abs - margin_fav
+
+            if abs(diff) < eps:
+                covered = 2   # ➖ push
+            elif diff > 0:
+                covered = 1   # ✅ covered
+            else:
+                covered = 0   # ❌ missed
 
             final_score_str = f"{fav} {fav_score} - {dog} {dog_score}"
 
@@ -821,6 +876,20 @@ def update_final_scores_from_odds():
                 ),
                 {"fs": final_score_str, "cov": covered, "id": int(row["id"])},
             )
+            load_all_logs.clear()
+            updated_count += 1
+            print(
+                f"[refresh] Updated id={row['id']}: {final_score_str}, "
+                f"margin_fav={margin_fav}, pick='{pick}', covered={covered}"
+            )
+
+    st.success(
+        f"Refreshed scores via Odds API. "
+        f"Updated {updated_count} rows, "
+        f"{skipped_no_match} had no matching game, "
+        f"{skipped_no_scores} had no scores yet."
+    )
+
 
 
 # =========================
@@ -917,6 +986,13 @@ with tab_single:
                 ],
                 use_container_width=True,
             )
+            
+            # 🔁 NEW: toggle to auto-apply projections
+            st.checkbox(
+                "Auto-apply cheatsheet projections when available",
+                value=st.session_state.get("auto_cheat_apply", False),
+                key="auto_cheat_apply",
+            )
         else:
             st.caption("No cheatsheet loaded yet.")
     
@@ -959,6 +1035,8 @@ with tab_single:
         except Exception as e:
             st.caption(f"Cheatsheet lookup error: {e}")
 
+    auto_apply = st.session_state.get("auto_cheat_apply", False)
+
     st.subheader("Projected Scores (Stat Model)")
 
     # Initialize state once
@@ -967,7 +1045,7 @@ with tab_single:
     if "proj_dog_input" not in st.session_state:
         st.session_state["proj_dog_input"] = 104.0
 
-    # If cheatsheet projections exist, show them and enable button
+    # If cheatsheet projections exist, show them and optionally auto-apply
     if (cheat_pf is not None) and (cheat_pd is not None):
         st.info(
             f"Cheatsheet projections found: "
@@ -975,9 +1053,22 @@ with tab_single:
             f"{underdog.upper()} {cheat_pd:.1f}"
         )
 
+        # Unique key for this specific matchup so we don't keep overwriting
+        current_game_key = f"{favorite.upper()}_{underdog.upper()}_{home_abbr}_{away_abbr}"
+        last_key = st.session_state.get("last_cheat_apply_key")
+
+        # 🔁 Auto-apply once per game when toggle is on
+        if auto_apply and current_game_key != last_key:
+            st.session_state["proj_fav_input"] = float(cheat_pf)
+            st.session_state["proj_dog_input"] = float(cheat_pd)
+            st.session_state["last_cheat_apply_key"] = current_game_key
+            st.rerun()
+
+        # Manual override button still available
         if st.button("Use cheatsheet projections", key="use_cheatsheet_proj"):
             st.session_state["proj_fav_input"] = float(cheat_pf)
             st.session_state["proj_dog_input"] = float(cheat_pd)
+            st.session_state["last_cheat_apply_key"] = current_game_key
             st.rerun()
     else:
         st.caption("No matching cheatsheet row for this game.")
@@ -1538,13 +1629,14 @@ with tab_slate:
                 year = 2000 + yy if yy < 100 else yy
 
                 game_date = datetime.date(year, month, day)
-
                 key = (game_date, frozenset({away_abbr, home_abbr}))
 
-                text = extract_text_from_pdf(uploaded)
-                if text.strip():
+                # ✅ use ctg_text, don't shadow sqlalchemy.text
+                ctg_text = extract_text_from_pdf(uploaded)
+
+                if ctg_text.strip():
                     ctg_docs[key] = {
-                        "text": text,
+                        "text": ctg_text,
                         "name": uploaded.name,
                     }
                     st.success(
@@ -1590,7 +1682,7 @@ with tab_slate:
         if "spread_covered" in review_logs.columns:
             review_logs = review_logs.copy()
             review_logs["Spread Covered"] = review_logs["spread_covered"].map(
-                {1: "✅ Covered", 0: "❌ Missed"}
+                {1: "✅ Covered", 0: "❌ Missed", 2: "➖ Push"}
             )
         else:
             review_logs["Spread Covered"] = ""
@@ -1642,6 +1734,8 @@ with tab_slate:
                     st.markdown(f"**Result:** ✅ Covered — Final score: {fs}")
                 elif cov == 0:
                     st.markdown(f"**Result:** ❌ Missed — Final score: {fs}")
+                elif cov == 2:
+                    st.markdown(f"**Result:** ➖ Push - Final Score: {fs}")
                 else:
                     st.markdown(f"**Result:** Final score: {fs}")
             else:
@@ -1731,7 +1825,7 @@ with tab_slate:
             if "spread_covered" in today_logs.columns:
                 today_logs = today_logs.copy()
                 today_logs["Spread Covered"] = today_logs["spread_covered"].map(
-                    {1: "✅ Covered", 0: "❌ Missed"}
+                    {1: "✅ Covered", 0: "❌ Missed", 2: "➖ Push"}
                 )
             else:
                 today_logs["Spread Covered"] = ""
@@ -1776,33 +1870,30 @@ with tab_logs:
             st.success("Deleted last logged pick.")
             st.rerun()
 
-    #with col_btn3:
-     #   if st.button("🔥 Clear ALL Logs"):
-      #      with engine.begin() as conn:
-       #         conn.execute(text("DELETE FROM logs"))
-        #    st.success("All logs cleared.")
-         #   st.rerun()
-
     try:
         logs = load_all_logs().sort_values("id", ascending=False).reset_index(drop=True)
         if logs.empty:
             st.info("No logs yet.")
         else:
+            # -------- MAIN TABLE WITH DATE SEPARATORS --------
             display_logs = logs.copy()
 
             # Friendly "Spread Covered" col
             if "spread_covered" in display_logs.columns:
                 display_logs["Spread Covered"] = display_logs["spread_covered"].map(
-                    {1: "✅ Covered", 0: "❌ Missed"}
+                    {1: "✅ Covered", 0: "❌ Missed", 2: "➖ Push"}
                 )
             else:
                 display_logs["Spread Covered"] = ""
 
+            # Rename final_score for table
             if "final_score" in display_logs.columns:
                 display_logs.rename(columns={"final_score": "Final score"}, inplace=True)
 
-            # Hide internal columns we don't want in main table
+            # Drop internal columns, including vegas_line and id
             for col in [
+                "id",
+                "vegas_line",
                 "spread_covered",
                 "fav_pace",
                 "dog_pace",
@@ -1825,7 +1916,6 @@ with tab_logs:
                 "vegas_margin",
                 "hybrid_margin",
                 "effective_edge",
-                "model_line",
                 "ctg_notes",
                 "ctg_reason",
                 "ctg_summary",
@@ -1833,128 +1923,249 @@ with tab_logs:
                 if col in display_logs.columns:
                     display_logs = display_logs.drop(columns=[col])
 
-            st.dataframe(display_logs, use_container_width=True)
+            # Columns we actually want in the table
+            cols_for_table = [
+                "date",
+                "favorite",
+                "underdog",
+                "edge",
+                "pick",
+                "confidence",
+                "Spread Covered",
+                "Final score",
+            ]
+            cols_for_table = [c for c in cols_for_table if c in display_logs.columns]
+            display_logs = display_logs[cols_for_table]
 
+            # Sort by date (desc)
+            display_logs_sorted = display_logs.sort_values(
+                by=["date"], ascending=[False]
+            )
+
+            # Build a new DataFrame with bold header rows per date
+            rows = []
+            for date_val, group in display_logs_sorted.groupby("date", sort=False):
+                # Header row for this date
+                header_row = {col: "" for col in display_logs_sorted.columns}
+                header_row["date"] = str(date_val)
+                header_row["_is_header"] = True
+                # Make sure edge is truly empty so formatter skips it
+                header_row["edge"] = None
+                rows.append(header_row)
+
+                # Actual game rows
+                for _, r in group.iterrows():
+                    d = r.to_dict()
+                    d["_is_header"] = False
+                    rows.append(d)
+
+            table_df = pd.DataFrame(rows)
+
+            # --- Build header mask, then drop helper column ---
+            header_mask = (
+                table_df["_is_header"].fillna(False).astype(bool)
+                if "_is_header" in table_df.columns
+                else pd.Series(False, index=table_df.index)
+            )
+
+            if "_is_header" in table_df.columns:
+                table_df = table_df.drop(columns=["_is_header"])
+
+            # Robust formatter for edge (handles None/strings)
+            format_dict = {}
+            if "edge" in table_df.columns:
+                def fmt_edge(x):
+                    try:
+                        if pd.isna(x):
+                            return ""
+                        return f"{float(x):.2f}"
+                    except Exception:
+                        return str(x)
+                format_dict["edge"] = fmt_edge
+
+            # Styling: bold header rows using the mask
+            def style_rows(row):
+                # row.name is the index in table_df, which matches header_mask index
+                if header_mask.loc[row.name]:
+                    return [
+                        "font-weight: bold; background-color: #222222; color: #ffffff;"
+                    ] * len(row)
+                return [""] * len(row)
+
+            styled_table = (
+                table_df.style
+                .apply(style_rows, axis=1)
+                .format(format_dict)
+            )
+
+            st.dataframe(styled_table, use_container_width=True, hide_index=True)
+
+            # -------- PER-GAME DETAILS, GROUPED BY DATE --------
             st.markdown("### 🔍 Per-Game Details (Pace / Ratings Tags)")
 
-            for _, row in logs.iterrows():
-                fav = str(row["favorite"]).upper()
-                dog = str(row["underdog"]).upper()
-                date = row["date"]
-                pick = row["pick"]
-                edge = row["edge"]
-                conf = row["confidence"]
+            # Sort logs by date desc, then id desc
+            logs_sorted = logs.sort_values(
+                by=["date", "id"], ascending=[False, False]
+            )
 
-                fav_pace = get_team_metric(fav, ["Pace", "PACE"])
-                dog_pace = get_team_metric(dog, ["Pace", "PACE"])
+            for date_val, day_group in logs_sorted.groupby("date", sort=False):
+                with st.expander(f"{date_val} — {len(day_group)} logged pick(s)"):
+                    for _, row in day_group.iterrows():
+                        fav = str(row["favorite"]).upper()
+                        dog = str(row["underdog"]).upper()
+                        date = row["date"]
+                        pick = row["pick"]
+                        edge = row["edge"]
+                        conf = row["confidence"]
 
-                fav_ortg = get_team_metric(
-                    fav, ["ORtg", "ORTG", "OffRtg", "OFF_RTG"]
-                )
-                fav_drtg = get_team_metric(
-                    fav, ["DRtg", "DRTG", "DefRtg", "DEF_RTG"]
-                )
-                fav_netr = get_team_metric(
-                    fav, ["NetRtg", "NETRTG", "Base Net Rating", "Base net"]
-                )
+                        fav_pace = get_team_metric(fav, ["Pace", "PACE"])
+                        dog_pace = get_team_metric(dog, ["Pace", "PACE"])
 
-                dog_ortg = get_team_metric(
-                    dog, ["ORtg", "ORTG", "OffRtg", "OFF_RTG"]
-                )
-                dog_drtg = get_team_metric(
-                    dog, ["DRtg", "DRTG", "DefRtg", "DEF_RTG"]
-                )
-                dog_netr = get_team_metric(
-                    dog, ["NetRtg", "NETRTG", "Base Net Rating", "Base net"]
-                )
+                        fav_ortg = get_team_metric(
+                            fav, ["ORtg", "ORTG", "OffRtg", "OFF_RTG"]
+                        )
+                        fav_drtg = get_team_metric(
+                            fav, ["DRtg", "DRTG", "DefRtg", "DEF_RTG"]
+                        )
+                        fav_netr = get_team_metric(
+                            fav, ["NetRtg", "NETRTG", "Base Net Rating", "Base net"]
+                        )
 
-                title = f"{date} — {fav} vs {dog}  |  Pick: {pick}  (Edge {edge:.2f}, {conf})"
+                        dog_ortg = get_team_metric(
+                            dog, ["ORtg", "ORTG", "OffRtg", "OFF_RTG"]
+                        )
+                        dog_drtg = get_team_metric(
+                            dog, ["DRtg", "DRTG", "DefRtg", "DEF_RTG"]
+                        )
+                        dog_netr = get_team_metric(
+                            dog, ["NetRtg", "NETRTG", "Base Net Rating", "Base net"]
+                        )
 
-                with st.expander(title):
-                    st.write(f"**Logged pick:** {pick}")
-                    st.write(f"**Vegas line at time:** {row['vegas_line']:+.1f}")
-                    st.write(f"**Model edge:** {edge:.2f} pts")
-                    st.write(f"**Confidence:** {conf}")
-                    # Cheatsheet vs hybrid at log time
-                    cheat_edge_row = row.get("cheat_edge", None)
-                    cheat_pick_row = row.get("cheat_pick", None)
-                    aligned_flag = row.get("models_aligned", None)
-                    hybrid_pick_row = row.get("hybrid_pick", None)
+                        title = (
+                            f"{fav} vs {dog}  |  Pick: {pick}  "
+                            f"(Edge {edge:.2f}, {conf})"
+                        )
 
-                    if pd.notna(cheat_edge_row):
-                        cheat_edge_val = float(cheat_edge_row)
+                        with st.expander(title):
+                            st.write(f"**Logged pick:** {pick}")
+                            st.write(f"**Date:** {date}")
+                            if "vegas_line" in row and pd.notna(row["vegas_line"]):
+                                st.write(f"**Vegas line at time:** {row['vegas_line']:+.1f}")
+                            st.write(f"**Model edge:** {edge:.2f} pts")
+                            st.write(f"**Confidence:** {conf}")
 
-                        if aligned_flag == 1:
-                            st.markdown(
-                                f"**Models aligned** at log time. "
-                                f"Cheatsheet: {cheat_pick_row} "
-                                f"(edge {cheat_edge_val:.2f})."
+                            # Cheatsheet vs hybrid at log time
+                            cheat_edge_row = row.get("cheat_edge", None)
+                            cheat_pick_row = row.get("cheat_pick", None)
+                            aligned_flag = row.get("models_aligned", None)
+                            hybrid_pick_row = row.get("hybrid_pick", None)
+
+                            if pd.notna(cheat_edge_row):
+                                cheat_edge_val = float(cheat_edge_row)
+
+                                if aligned_flag == 1:
+                                    st.markdown(
+                                        f"**Models aligned** at log time. "
+                                        f"Cheatsheet: {cheat_pick_row} "
+                                        f"(edge {cheat_edge_val:.2f})."
+                                    )
+                                else:
+                                    st.markdown(
+                                        f"**Models disagreed** at log time. "
+                                        f"Cheatsheet: {cheat_pick_row} "
+                                        f"(edge {cheat_edge_val:.2f}). "
+                                        f"Hybrid model: {hybrid_pick_row}."
+                                    )
+
+                            # Result + which model side covered (when misaligned)
+                            fs = row.get("final_score", None)
+                            cov = row.get("spread_covered", None)
+
+                            if fs and pd.notna(fs):
+                                if cov == 1:
+                                    st.markdown(f"**Result:** ✅ Covered — Final score: {fs}")
+                                elif cov == 0:
+                                    st.markdown(f"**Result:** ❌ Missed — Final score: {fs}")
+                                elif cov == 2:
+                                    st.markdown(f"**Result:** ➖ Push — Final score: {fs}")
+                                else:
+                                    st.markdown(f"**Result:** Final score: {fs}")
+
+                                # Extra line ONLY when models disagreed and we know outcome
+                                if (
+                                    pd.notna(cheat_edge_row)
+                                    and aligned_flag == 0
+                                    and cov in (0, 1)
+                                ):
+                                    cheat_pick_str = str(cheat_pick_row) if pd.notna(cheat_pick_row) else ""
+                                    hybrid_pick_str = str(hybrid_pick_row) if pd.notna(hybrid_pick_row) else ""
+                                    logged_pick_str = str(pick)
+
+                                    which_model = None
+                                    # If our logged pick covered, whichever model matched logged pick "covered"
+                                    if cov == 1:
+                                        if logged_pick_str == cheat_pick_str:
+                                            which_model = "Cheatsheet model side"
+                                        elif logged_pick_str == hybrid_pick_str:
+                                            which_model = "Hybrid model side"
+                                    # If our logged pick missed but models disagreed,
+                                    # the *other* side would have covered.
+                                    elif cov == 0:
+                                        if logged_pick_str == cheat_pick_str and hybrid_pick_str:
+                                            which_model = "Hybrid model side would have covered"
+                                        elif logged_pick_str == hybrid_pick_str and cheat_pick_str:
+                                            which_model = "Cheatsheet model side would have covered"
+
+                                    if which_model:
+                                        st.markdown(f"**Model outcome note:** {which_model}.")
+
+                            else:
+                                st.markdown("**Result:** Final score not logged yet.")
+
+                            st.markdown("**Team Metrics Snapshot (at time of view)**")
+
+                            metrics_rows = [
+                                {
+                                    "Team": fav,
+                                    "Role": "Favorite",
+                                    "Pace": f"{fav_pace:.1f}"
+                                    if fav_pace is not None
+                                    else "—",
+                                    "ORtg": f"{fav_ortg:.1f}"
+                                    if fav_ortg is not None
+                                    else "—",
+                                    "DRtg": f"{fav_drtg:.1f}"
+                                    if fav_drtg is not None
+                                    else "—",
+                                    "NetRtg": f"{fav_netr:.1f}"
+                                    if fav_netr is not None
+                                    else "—",
+                                },
+                                {
+                                    "Team": dog,
+                                    "Role": "Underdog",
+                                    "Pace": f"{dog_pace:.1f}"
+                                    if dog_pace is not None
+                                    else "—",
+                                    "ORtg": f"{dog_ortg:.1f}"
+                                    if dog_ortg is not None
+                                    else "—",
+                                    "DRtg": f"{dog_drtg:.1f}"
+                                    if dog_drtg is not None
+                                    else "—",
+                                    "NetRtg": f"{dog_netr:.1f}"
+                                    if dog_netr is not None
+                                    else "—",
+                                },
+                            ]
+
+                            st.table(pd.DataFrame(metrics_rows))
+
+                            st.caption(
+                                "These tags are pulled from the current `Team_ratings.csv` "
+                                "(not historically frozen yet). Later we can upgrade this "
+                                "to snapshot the values at the time of the bet for true backtesting."
                             )
-                        else:
-                            st.markdown(
-                                f"**Models disagreed** at log time. "
-                                f"Cheatsheet: {cheat_pick_row} "
-                                f"(edge {cheat_edge_val:.2f}). "
-                                f"Hybrid model: {hybrid_pick_row}."
-                            )
-                            
-                    if "final_score" in row and pd.notna(row["final_score"]):
-                        fs = row["final_score"]
-                        cov = row.get("spread_covered", None)
-                        if cov == 1:
-                            st.markdown(f"**Result:** ✅ Covered — Final score: {fs}")
-                        elif cov == 0:
-                            st.markdown(f"**Result:** ❌ Missed — Final score: {fs}")
-                        else:
-                            st.markdown(f"**Result:** Final score: {fs}")
-                    else:
-                        st.markdown("**Result:** Final score not logged yet.")
-
-                    st.markdown("**Team Metrics Snapshot (at time of view)**")
-
-                    metrics_rows = [
-                        {
-                            "Team": fav,
-                            "Role": "Favorite",
-                            "Pace": f"{fav_pace:.1f}"
-                            if fav_pace is not None
-                            else "—",
-                            "ORtg": f"{fav_ortg:.1f}"
-                            if fav_ortg is not None
-                            else "—",
-                            "DRtg": f"{fav_drtg:.1f}"
-                            if fav_drtg is not None
-                            else "—",
-                            "NetRtg": f"{fav_netr:.1f}"
-                            if fav_netr is not None
-                            else "—",
-                        },
-                        {
-                            "Team": dog,
-                            "Role": "Underdog",
-                            "Pace": f"{dog_pace:.1f}"
-                            if dog_pace is not None
-                            else "—",
-                            "ORtg": f"{dog_ortg:.1f}"
-                            if dog_ortg is not None
-                            else "—",
-                            "DRtg": f"{dog_drtg:.1f}"
-                            if dog_drtg is not None
-                            else "—",
-                            "NetRtg": f"{dog_netr:.1f}"
-                            if dog_netr is not None
-                            else "—",
-                        },
-                    ]
-
-                    st.table(pd.DataFrame(metrics_rows))
-
-                    st.caption(
-                        "These tags are pulled from the current `Team_ratings.csv` "
-                        "(not historically frozen yet). Later we can upgrade this "
-                        "to snapshot the values at the time of the bet for true backtesting."
-                    )
 
     except Exception as e:
         st.warning(f"No log table yet or error reading logs: {e}")
-
