@@ -8,11 +8,15 @@ import re
 from zoneinfo import ZoneInfo
 from sqlalchemy import create_engine, text
 import pdfplumber
+from dotenv import load_dotenv
+from openai import OpenAI  # <- keep this import
 
-from openai import OpenAI  # <- keep just this import
+# Load environment variables from .env
+load_dotenv()
 
-# Create OpenAI client (reads OPENAI_API_KEY from environment)
-client = OpenAI()
+# Read key from environment and create client
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # =========================
@@ -500,10 +504,116 @@ Return a JSON object with keys: "reason", "summary".
         summary = resp.choices[0].message.content.strip()
 
     return reason, summary
+    
+def get_team_recent_games(team_abbr: str, scores: list, game_dt: datetime.datetime):
+    """
+    From the scores list, return this team's games before `game_dt`,
+    sorted most-recent first.
+    """
+    team_abbr = team_abbr.upper()
+    recent = []
+    for g in scores:
+        dt = g.get("commence_dt")
+        if not dt or dt >= game_dt:
+            continue
+        if team_abbr in (g["home_abbr"], g["away_abbr"]):
+            recent.append(g)
+    recent.sort(key=lambda gg: gg["commence_dt"], reverse=True)
+    return recent
 
 
+def compute_rest_profile(
+    team_abbr: str,
+    is_home_now: bool,
+    game_dt: datetime.datetime,
+    scores: list,
+) -> dict:
+    """
+    Build a schedule/rest profile for one team for this game:
 
+    - days_since_last
+    - games_last_5 (last 5 days)
+    - is_b2b
+    - b2b_penalty  (points, negative = more gassed)
+    - travel_penalty (small non-B2B travel tax)
+    - desc (for UI)
+    """
+    recent = get_team_recent_games(team_abbr, scores, game_dt)
+    today = game_dt.date()
 
+    last_game_dt = None
+    last_is_home = None
+    games_last_5 = 0
+
+    for g in recent:
+        dt = g.get("commence_dt")
+        if not dt:
+            continue
+
+        delta_days = (today - dt.date()).days
+
+        # games in last 5 days
+        if 1 <= delta_days <= 5:
+            games_last_5 += 1
+
+        # first (most recent) game
+        if last_game_dt is None:
+            last_game_dt = dt
+            last_is_home = (g["home_abbr"] == team_abbr.upper())
+
+    days_since = None
+    is_b2b = False
+    travel_pattern = None
+    b2b_penalty = 0.0
+    travel_penalty = 0.0
+
+    if last_game_dt is not None:
+        days_since = (today - last_game_dt.date()).days
+        prev_is_home = bool(last_is_home)
+        cur_is_home = bool(is_home_now)
+
+        if days_since == 1:
+            # Back-to-back classification
+            if prev_is_home and cur_is_home:
+                travel_pattern = "H→H"
+                b2b_penalty = -1.0
+            elif prev_is_home and not cur_is_home:
+                travel_pattern = "H→A"
+                b2b_penalty = -1.3
+            elif (not prev_is_home) and cur_is_home:
+                travel_pattern = "A→H"
+                b2b_penalty = -1.3
+            else:
+                travel_pattern = "A→A"
+                b2b_penalty = -1.6
+            is_b2b = True
+        else:
+            # Non-B2B travel tax: small nudge only
+            if prev_is_home != cur_is_home:
+                travel_pattern = "travel"
+                travel_penalty = -0.2
+            else:
+                travel_pattern = "no-travel"
+
+    # Text summary
+    desc_parts = []
+    if days_since is not None:
+        desc_parts.append(f"{days_since} days rest")
+    if games_last_5:
+        desc_parts.append(f"{games_last_5} games last 5d")
+    if is_b2b:
+        desc_parts.append(f"B2B {travel_pattern}")
+    elif travel_pattern and travel_pattern != "no-travel":
+        desc_parts.append(travel_pattern)
+
+    return {
+        "days_since": days_since,
+        "games_last_5": games_last_5,
+        "is_b2b": is_b2b,
+        "b2b_penalty": float(b2b_penalty),
+        "travel_penalty": float(travel_penalty),
+        "desc": ", ".join(desc_parts) if desc_parts else "None",
+    }
 
 # =========================
 # Odds & Scores Fetch
@@ -1007,13 +1117,51 @@ with tab_single:
     
 
     # Situational flags (Back-to-Back)
-    st.subheader("Situational Flags (B2B)")
-    col_flag1, col_flag2 = st.columns(2)
-    with col_flag1:
-        b2b_home = st.checkbox(f"{home_abbr} B2B", value=False)
-    with col_flag2:
-        b2b_away = st.checkbox(f"{away_abbr} B2B", value=False)
+    # =========================
+    # Auto Schedule / B2B Detection
+    # =========================
+    st.subheader("Schedule / B2B (Auto)")
 
+    if not manual_mode and game_status != "MANUAL" and game.get("commence_dt"):
+        schedule_scores = fetch_scores(days_from=7)
+        home_rest = compute_rest_profile(
+            home_abbr,
+            is_home_now=True,
+            game_dt=game["commence_dt"],
+            scores=schedule_scores,
+        )
+        away_rest = compute_rest_profile(
+            away_abbr,
+            is_home_now=False,
+            game_dt=game["commence_dt"],
+            scores=schedule_scores,
+        )
+
+        st.caption(
+            f"Schedule — {home_abbr}: {home_rest['desc']} | "
+            f"{away_abbr}: {away_rest['desc']}"
+        )
+
+        st.session_state["home_rest_profile"] = home_rest
+        st.session_state["away_rest_profile"] = away_rest
+    else:
+        # Manual / fallback: no schedule data
+        home_rest = {
+            "days_since": None,
+            "games_last_5": 0,
+            "is_b2b": False,
+            "b2b_penalty": 0.0,
+            "travel_penalty": 0.0,
+            "desc": "N/A",
+        }
+        away_rest = home_rest.copy()
+        st.session_state["home_rest_profile"] = home_rest
+        st.session_state["away_rest_profile"] = away_rest
+        st.caption("Schedule info unavailable (manual mode).")
+    
+    # =========================
+    # Spread + Score Inputs
+    # =========================
     st.subheader("Spread + Score Inputs")
 
     colA, colB, colC = st.columns(3)
@@ -1244,49 +1392,68 @@ with tab_single:
             env_pace = ((fav_pace + dog_pace) / 2.0) - LEAGUE_AVG_PACE
             pace_adj = pace_delta * PACE_DELTA_WEIGHT + env_pace * PACE_ENV_WEIGHT
 
-        # --- B2B + schedule density ---
-        B2B_PENALTY = 1.5
+        # --- Rest / B2B adjustments (fav perspective) ---
         b2b_adj = 0.0
-        b2b_desc_parts: list[str] = []
-
-        if b2b_home:
-            delta_home = -B2B_PENALTY if favorite.upper() == home_abbr else B2B_PENALTY
-            b2b_adj += delta_home
-            b2b_desc_parts.append(f"{home_abbr} {delta_home:+.2f}")
-
-        if b2b_away:
-            delta_away = -B2B_PENALTY if favorite.upper() == away_abbr else B2B_PENALTY
-            b2b_adj += delta_away
-            b2b_desc_parts.append(f"{away_abbr} {delta_away:+.2f}")
-
-        b2b_desc = ", ".join(b2b_desc_parts) if b2b_desc_parts else "None"
-
         rest_adj = 0.0
+        b2b_desc = "None"
         rest_desc = "None"
-        try:
+
+        home_rest = st.session_state.get("home_rest_profile")
+        away_rest = st.session_state.get("away_rest_profile")
+
+        if home_rest and away_rest and not manual_mode:
             fav_is_home = favorite.upper() == home_abbr
 
-            home_games = float(home_games_last5)
-            away_games = float(away_games_last5)
-
             if fav_is_home:
-                fav_games = home_games
-                dog_games = away_games
+                fav_b2b_pen = home_rest["b2b_penalty"]
+                dog_b2b_pen = away_rest["b2b_penalty"]
+                fav_games5 = home_rest["games_last_5"]
+                dog_games5 = away_rest["games_last_5"]
             else:
-                fav_games = away_games
-                dog_games = home_games
+                fav_b2b_pen = away_rest["b2b_penalty"]
+                dog_b2b_pen = home_rest["b2b_penalty"]
+                fav_games5 = away_rest["games_last_5"]
+                dog_games5 = home_rest["games_last_5"]
 
-            games_diff = fav_games - dog_games  # >0 fav more taxed
+            # B2B adj: difference in B2B penalties (fav perspective)
+            b2b_adj = fav_b2b_pen - dog_b2b_pen
 
+            # Rest adj: difference in games in last 5 days (fav perspective)
+            games_diff = fav_games5 - dog_games5
             if games_diff != 0:
                 rest_adj = -games_diff * REST_GAME_WEIGHT
-                if abs(games_diff) >= 3:
-                    rest_desc = f"{int(fav_games)}–{int(dog_games)} (heavy rest edge)"
-                else:
-                    rest_desc = f"{int(fav_games)}–{int(dog_games)}"
-        except Exception:
+
+            # Descriptions for UI
+            b2b_desc_parts = []
+            if home_rest["is_b2b"]:
+                b2b_desc_parts.append(
+                    f"{home_abbr} B2B ({home_rest['days_since']}d rest, "
+                    f"{home_rest['games_last_5']}g/5d)"
+                )
+            if away_rest["is_b2b"]:
+                b2b_desc_parts.append(
+                    f"{away_abbr} B2B ({away_rest['days_since']}d rest, "
+                    f"{away_rest['games_last_5']}g/5d)"
+                )
+            b2b_desc = "; ".join(b2b_desc_parts) if b2b_desc_parts else "None"
+            rest_desc = f"{fav_games5}–{dog_games5} (fav–dog games last 5d)"
+        else:
+            b2b_adj = 0.0
             rest_adj = 0.0
+            b2b_desc = "None"
             rest_desc = "N/A"
+
+        # --- Per-team B2B flags used for learning/logging ---
+        fav_is_b2b = 0
+        dog_is_b2b = 0
+        if home_rest and away_rest and not manual_mode:
+            fav_is_home = favorite.upper() == home_abbr
+            if fav_is_home:
+                fav_is_b2b = 1 if home_rest.get("is_b2b") else 0
+                dog_is_b2b = 1 if away_rest.get("is_b2b") else 0
+            else:
+                fav_is_b2b = 1 if away_rest.get("is_b2b") else 0
+                dog_is_b2b = 1 if home_rest.get("is_b2b") else 0
 
         # --- Hybrid margin ---
         hybrid_margin = (
@@ -1378,6 +1545,8 @@ with tab_single:
                 "dog_drtg": float(dog_drtg) if dog_drtg is not None else None,
                 "fav_netr": float(fav_netr) if fav_netr is not None else None,
                 "dog_netr": float(dog_netr) if dog_netr is not None else None,
+                "fav_is_b2b": int(fav_is_b2b),
+                "dog_is_b2b": int(dog_is_b2b),
                 "color": color,
             }
         )
@@ -1424,6 +1593,9 @@ with tab_single:
         dog_drtg = st.session_state["dog_drtg"]
         fav_netr = st.session_state["fav_netr"]
         dog_netr = st.session_state["dog_netr"]
+        fav_is_b2b = st.session_state.get("fav_is_b2b", 0)
+        dog_is_b2b = st.session_state.get("dog_is_b2b", 0)
+
         color = st.session_state["color"]
 
         fav_pick_str = side_to_pick("favorite", fav, dog, vegas_line)
