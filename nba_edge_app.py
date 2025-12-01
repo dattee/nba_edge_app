@@ -914,8 +914,17 @@ with tab_single:
     games_data = fetch_games_with_odds()
 
     manual_mode = False
+    if games_data:
+        now_et = datetime.datetime.now(ET_TZ)
+        today_et = now_et.date()
+        # Only keep games whose scheduled start is today in ET
+        games_data = [
+            g for g in games_data
+            if g.get("commence_dt") and g["commence_dt"].date() == today_et
+        ]
+
     if not games_data:
-        st.warning("⚠ Odds API unavailable — switching to manual mode.")
+        st.warning("⚠ No games found for today from Odds API — switching to manual mode.")
         manual_mode = True
         games_display = ["Manual Entry"]
     else:
