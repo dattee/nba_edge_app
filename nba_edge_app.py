@@ -173,6 +173,18 @@ with engine.connect() as conn:
     if "ctg_summary" not in col_names:
         conn.execute(text("ALTER TABLE logs ADD COLUMN ctg_summary TEXT"))
 
+    # B2B flags for each team
+    if "fav_is_b2b" not in col_names:
+        conn.execute(text("ALTER TABLE logs ADD COLUMN fav_is_b2b INTEGER"))
+    if "dog_is_b2b" not in col_names:
+        conn.execute(text("ALTER TABLE logs ADD COLUMN dog_is_b2b INTEGER"))
+
+    # Injury / outs snapshot
+    if "home_out" not in col_names:
+        conn.execute(text("ALTER TABLE logs ADD COLUMN home_out TEXT"))
+    if "away_out" not in col_names:
+        conn.execute(text("ALTER TABLE logs ADD COLUMN away_out TEXT"))
+
 # =========================
 # Log loading helper
 # =========================
@@ -1726,6 +1738,8 @@ with tab_single:
                         "dog_drtg": dog_drtg,
                         "fav_netr": fav_netr,
                         "dog_netr": dog_netr,
+                        "home_out": ", ".join(home_out) if home_out else None,
+                        "away_out": ", ".join(away_out) if away_out else None,
                         "cheat_edge": cheat_edge,
                         "cheat_pick": cheat_pick,
                         "models_aligned": 1 if aligned else 0,
