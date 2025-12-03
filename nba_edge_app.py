@@ -1031,7 +1031,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_single, tab_slate, tab_logs = st.tabs(["Single Game","Slate View", "Prediction Log"])
+tab_single, tab_full, tab_ctg, tab_logs = st.tabs(
+    ["Single Game", "Full Slate", "CTG Review", "Prediction Log"]
+)
 
 # ============================================
 # SINGLE GAME ANALYZER
@@ -1787,10 +1789,117 @@ with tab_single:
             st.rerun()
 
 # ============================================
-# SLATE VIEW / DAILY REVIEW
+# FULL SLATE AUTO VIEW
 # ============================================
-with tab_slate:
-    st.subheader("Slate View & Daily Review")
+with tab_full:
+    st.subheader("Full Slate (Team-Only Auto View)")
+
+    games_data = fetch_games_with_odds()
+
+    if not games_data:
+        st.info("No odds data available for today's slate (or Odds API unavailable).")
+    else:
+        rows = []
+        for g in games_data:
+            # Skip completed games; this is for upcoming/live
+            if g.get("status") == "FINAL":
+                continue
+
+            home_abbr = g.get("home_abbr")
+            away_abbr = g.get("away_abbr")
+            favorite_abbr = g.get("favorite_abbr")
+            underdog_abbr = g.get("underdog_abbr")
+            vegas_line = float(g.get("spread", 0.0))
+            status = g.get("status")
+            commence = g.get("commence_dt")
+
+            if not home_abbr or not away_abbr or not favorite_abbr or not underdog_abbr:
+                continue
+
+            # --- Team strength (same helper as Single Game) ---
+            home_power = get_team_power(home_abbr, is_home=True)
+            away_power = get_team_power(away_abbr, is_home=False)
+
+            if home_power is None or away_power is None:
+                # Missing rating, skip
+                continue
+
+            # Team margin in home-away coordinates
+            team_margin_home = home_power - away_power  # home - away
+
+            if favorite_abbr.upper() == home_abbr.upper():
+                fav_team_margin = team_margin_home
+            else:
+                fav_team_margin = -team_margin_home
+
+            # --- Team-only hybrid margin (no stats, no injuries) ---
+            vegas_margin = -vegas_line  # favorite perspective
+            stat_margin = 0.0
+            effective_player_adj = 0.0
+            pace_adj = 0.0
+            b2b_adj = 0.0
+            rest_adj = 0.0
+
+            hybrid_margin = (
+                stat_margin * W_SCORE
+                + fav_team_margin * W_TEAM
+                + effective_player_adj * W_PLAYER
+                + pace_adj
+                + b2b_adj
+                + rest_adj
+            )
+
+            diff = hybrid_margin - vegas_margin
+            edge = abs(diff)
+            side = "favorite" if diff > 0 else "underdog"
+
+            # Confidence thresholds (same ones you use elsewhere)
+            if edge >= STRONG_EDGE:
+                conf = "STRONG"
+            elif edge >= MEDIUM_EDGE:
+                conf = "MEDIUM"
+            else:
+                conf = "PASS"
+
+            # Tip-off label
+            if isinstance(commence, datetime.datetime):
+                tip_label = commence.strftime("%Y-%m-%d %I:%M %p").lstrip("0") + " ET"
+            else:
+                tip_label = "TBD"
+
+            rows.append(
+                {
+                    "away": away_abbr,
+                    "home": home_abbr,
+                    "fav": favorite_abbr,
+                    "dog": underdog_abbr,
+                    "spread": vegas_line,
+                    "model_margin_fav": round(hybrid_margin, 2),
+                    "edge_pts": round(edge, 2),
+                    "model_side": side,
+                    "confidence": conf,
+                    "status": status,
+                    "tip_off_et": tip_label,
+                }
+            )
+
+        if rows:
+            slate_df = pd.DataFrame(rows)
+            slate_df = slate_df.sort_values("edge_pts", ascending=False)
+
+            st.dataframe(
+                slate_df,
+                use_container_width=True,
+            )
+        else:
+            st.info("No games with enough data to show in the auto-slate view.")
+
+
+# ============================================
+# CTG REVIEW / DAILY REVIEW
+# ============================================
+with tab_ctg:
+    st.subheader("CTG Review & Daily Review")
 
     # --- CTG PDF upload (one or more files) ---
     st.markdown("### CTG Postgame Reports (Optional)")
