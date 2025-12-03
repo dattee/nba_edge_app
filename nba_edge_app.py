@@ -179,7 +179,13 @@ with engine.connect() as conn:
     if "dog_is_b2b" not in col_names:
         conn.execute(text("ALTER TABLE logs ADD COLUMN dog_is_b2b INTEGER"))
 
-    # Injury / outs snapshot
+    # Injury / outs snapshot (favorite / underdog perspective)
+    if "fav_out" not in col_names:
+        conn.execute(text("ALTER TABLE logs ADD COLUMN fav_out TEXT"))
+    if "dog_out" not in col_names:
+        conn.execute(text("ALTER TABLE logs ADD COLUMN dog_out TEXT"))
+
+    # Injury / outs snapshot (home / away perspective)
     if "home_out" not in col_names:
         conn.execute(text("ALTER TABLE logs ADD COLUMN home_out TEXT"))
     if "away_out" not in col_names:
@@ -1717,6 +1723,15 @@ with tab_single:
         if st.button("💾 Log This Pick"):
             logged_pick = pick_to_log
 
+            # Map home/away outs to favorite/underdog outs for logging
+            fav_is_home = favorite.upper() == home_abbr.upper()
+            if fav_is_home:
+                fav_out_list = home_out
+                dog_out_list = away_out
+            else:
+                fav_out_list = away_out
+                dog_out_list = home_out
+
             entry = pd.DataFrame(
                 [
                     {
@@ -1738,6 +1753,8 @@ with tab_single:
                         "dog_drtg": dog_drtg,
                         "fav_netr": fav_netr,
                         "dog_netr": dog_netr,
+                        "fav_out": ", ".join(fav_out_list) if fav_out_list else None,
+                        "dog_out": ", ".join(dog_out_list) if dog_out_list else None,
                         "home_out": ", ".join(home_out) if home_out else None,
                         "away_out": ", ".join(away_out) if away_out else None,
                         "cheat_edge": cheat_edge,
@@ -1909,14 +1926,14 @@ with tab_slate:
                 st.write(f"**Model edge (hybrid):** {edge:.2f} pts")
             st.write(f"**Confidence:** {conf}")
 
-            # Players who were out at log time (from logs.home_out / logs.away_out)
-            home_out = row.get("home_out", None)
-            away_out = row.get("away_out", None)
+            # Players who were out at log time (from logs.fav_out / logs.dog_out)
+            fav_out = row.get("fav_out", None)
+            dog_out = row.get("dog_out", None)
             outs_parts = []
-            if home_out:
-                outs_parts.append(f"{fav} outs: {home_out}")
-            if away_out:
-                outs_parts.append(f"{dog} outs: {away_out}")
+            if fav_out:
+                outs_parts.append(f"{fav} outs: {fav_out}")
+            if dog_out:
+                outs_parts.append(f"{dog} outs: {dog_out}")
             if outs_parts:
                 st.write("**Players out at log time:** " + " | ".join(outs_parts))
 
@@ -2245,14 +2262,14 @@ with tab_logs:
                             st.write(f"**Model edge:** {edge:.2f} pts")
                             st.write(f"**Confidence:** {conf}")
 
-                            # Players who were out at log time (from logs.home_out / logs.away_out)
-                            home_out = row.get("home_out", None)
-                            away_out = row.get("away_out", None)
+                            # Players who were out at log time (from logs.fav_out / logs.dog_out)
+                            fav_out = row.get("fav_out", None)
+                            dog_out = row.get("dog_out", None)
                             outs_parts = []
-                            if home_out:
-                                outs_parts.append(f"{fav} outs: {home_out}")
-                            if away_out:
-                                outs_parts.append(f"{dog} outs: {away_out}")
+                            if fav_out:
+                                outs_parts.append(f"{fav} outs: {fav_out}")
+                            if dog_out:
+                                outs_parts.append(f"{dog} outs: {dog_out}")
                             if outs_parts:
                                 st.write("**Players out at log time:** " + " | ".join(outs_parts))
 
