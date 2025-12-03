@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import create_engine, text
 import pdfplumber
 from dotenv import load_dotenv
-from openai import OpenAI  # <- keep this import
+from openai import OpenAI  
 
 # Load environment variables from .env
 load_dotenv()
