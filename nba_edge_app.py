@@ -1909,6 +1909,17 @@ with tab_slate:
                 st.write(f"**Model edge (hybrid):** {edge:.2f} pts")
             st.write(f"**Confidence:** {conf}")
 
+            # Players who were out at log time (from logs.home_out / away_out)
+            home_out = row.get("home_out", None)
+            away_out = row.get("away_out", None)
+            outs_parts = []
+            if home_out:
+                outs_parts.append(f"{fav} outs: {home_out}")
+            if away_out:
+                outs_parts.append(f"{dog} outs: {away_out}")
+            if outs_parts:
+                st.write("**Players out at log time:** " + " | ".join(outs_parts))
+
             if fs:
                 if cov == 1:
                     st.markdown(f"**Result:** ✅ Covered — Final score: {fs}")
