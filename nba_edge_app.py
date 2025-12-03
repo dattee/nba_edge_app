@@ -2327,6 +2327,15 @@ with tab_logs:
 
             for date_val, day_group in logs_sorted.groupby("date", sort=False):
                 with st.expander(f"{date_val} — {len(day_group)} logged pick(s)"):
+                    # --- NEW: per-date CSV download ---
+                    csv_day = day_group.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        label="📥 Download this date as CSV",
+                        data=csv_day,
+                        file_name=f"logged_picks_{date_val}.csv",
+                        mime="text/csv",
+                        key=f"download_logs_{date_val}",
+                    )   
                     for _, row in day_group.iterrows():
                         fav = str(row["favorite"]).upper()
                         dog = str(row["underdog"]).upper()
