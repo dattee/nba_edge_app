@@ -1068,7 +1068,45 @@ with tab_single:
             f"Status: **{game_status}** — {away_full} @ {home_full}, "
             f"line: {favorite_abbr} {vegas_line:.1f}"
         )
-        
+
+        # Auto Schedule / B2B Detection (status-adjacent, no header)
+        if game_status != "MANUAL" and game.get("commence_dt"):
+            schedule_scores = fetch_scores(days_from=7)
+            home_rest = compute_rest_profile(
+                home_abbr,
+                is_home_now=True,
+                game_dt=game["commence_dt"],
+                scores=schedule_scores,
+            )
+            away_rest = compute_rest_profile(
+                away_abbr,
+                is_home_now=False,
+                game_dt=game["commence_dt"],
+                scores=schedule_scores,
+            )
+
+            st.caption(
+                f"Schedule — {home_abbr}: {home_rest['desc']} | "
+                f"{away_abbr}: {away_rest['desc']}"
+            )
+
+            st.session_state["home_rest_profile"] = home_rest
+            st.session_state["away_rest_profile"] = away_rest
+        else:
+            # Manual / fallback: no schedule data
+            home_rest = {
+                "days_since": None,
+                "games_last_5": 0,
+                "is_b2b": False,
+                "b2b_penalty": 0.0,
+                "travel_penalty": 0.0,
+                "desc": "N/A",
+            }
+            away_rest = home_rest.copy()
+            st.session_state["home_rest_profile"] = home_rest
+            st.session_state["away_rest_profile"] = away_rest
+            st.caption("Schedule info unavailable (manual mode).")
+
     # =========================
     # Cheatsheet Import (Optional)
     # =========================
@@ -1116,49 +1154,6 @@ with tab_single:
             st.caption("No cheatsheet loaded yet.")
     
 
-    # Situational flags (Back-to-Back)
-    # =========================
-    # Auto Schedule / B2B Detection
-    # =========================
-    st.subheader("Schedule / B2B (Auto)")
-
-    if not manual_mode and game_status != "MANUAL" and game.get("commence_dt"):
-        schedule_scores = fetch_scores(days_from=7)
-        home_rest = compute_rest_profile(
-            home_abbr,
-            is_home_now=True,
-            game_dt=game["commence_dt"],
-            scores=schedule_scores,
-        )
-        away_rest = compute_rest_profile(
-            away_abbr,
-            is_home_now=False,
-            game_dt=game["commence_dt"],
-            scores=schedule_scores,
-        )
-
-        st.caption(
-            f"Schedule — {home_abbr}: {home_rest['desc']} | "
-            f"{away_abbr}: {away_rest['desc']}"
-        )
-
-        st.session_state["home_rest_profile"] = home_rest
-        st.session_state["away_rest_profile"] = away_rest
-    else:
-        # Manual / fallback: no schedule data
-        home_rest = {
-            "days_since": None,
-            "games_last_5": 0,
-            "is_b2b": False,
-            "b2b_penalty": 0.0,
-            "travel_penalty": 0.0,
-            "desc": "N/A",
-        }
-        away_rest = home_rest.copy()
-        st.session_state["home_rest_profile"] = home_rest
-        st.session_state["away_rest_profile"] = away_rest
-        st.caption("Schedule info unavailable (manual mode).")
-    
     # Spread + Score Inputs are now taken directly from the game / manual selection
     favorite = favorite_abbr
     underdog = underdog_abbr
