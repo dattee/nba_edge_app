@@ -4,7 +4,7 @@ import re
 import datetime
 import time
 from dataclasses import dataclass
-from typing import Optional, Dict
+from typing import Optional, Dict, Set
 from nba_api.stats.endpoints import commonallplayers, playergamelog
 import pandas as pd
 
@@ -89,6 +89,45 @@ def fetch_team_advanced_stats(season: str) -> pd.DataFrame:
     cols = [c for c in cols if c in df.columns]
 
     return df[cols].copy()
+
+
+def fetch_today_slate_teams(game_date: Optional[datetime.date] = None) -> Set[str]:
+    """
+    Use nba_api Scoreboard to get today's slate and return a set of
+    team abbreviations (e.g. {'ORL', 'SAS', ...}).
+    """
+    from nba_api.stats.endpoints import scoreboard
+    from nba_api.stats.static import teams as static_teams
+
+    if game_date is None:
+        game_date = datetime.date.today()
+
+    date_str = game_date.strftime("%m/%d/%Y")
+
+    print(f"Fetching scoreboard for {date_str} ...")
+    sb = scoreboard.Scoreboard(game_date=date_str, league_id="00", day_offset=0)
+
+    games = sb.game_header.get_data_frame()
+    if games.empty:
+        print("No games found on scoreboard for this date.")
+        return set()
+
+    teams_list = static_teams.get_teams()
+    id_to_abbr = {t["id"]: t["abbreviation"].upper() for t in teams_list}
+
+    slate: Set[str] = set()
+    for _, row in games.iterrows():
+        home_id = int(row["HOME_TEAM_ID"])
+        away_id = int(row["VISITOR_TEAM_ID"])
+        home_abbr = id_to_abbr.get(home_id)
+        away_abbr = id_to_abbr.get(away_id)
+        if home_abbr:
+            slate.add(home_abbr)
+        if away_abbr:
+            slate.add(away_abbr)
+
+    print(f"Today's slate teams: {', '.join(sorted(slate))}")
+    return slate
     
 # Map CSV names -> canonical names when they genuinely differ.
 # Example: your CSV might say "Cameron Thomas" but NBA uses "Cam Thomas".
@@ -196,7 +235,11 @@ def fetch_player_last_game(player_id: int, season: str) -> Optional[datetime.dat
         return None
 
 
-def update_team_ratings(team_ratings_path: str, season: str) -> None:
+def update_team_ratings(
+    team_ratings_path: str,
+    season: str,
+    only_teams: Optional[Set[str]] = None,
+) -> None:
     print(f"Loading team ratings from {team_ratings_path} ...")
     tr = pd.read_csv(team_ratings_path)
     if "Team" not in tr.columns:
@@ -211,6 +254,10 @@ def update_team_ratings(team_ratings_path: str, season: str) -> None:
     adv["TEAM_ABBREVIATION"] = adv["TEAM_ABBREVIATION"].str.upper()
     adv_map = {row["TEAM_ABBREVIATION"]: row for _, row in adv.iterrows()}
 
+    # Normalize only_teams to uppercase, if provided
+    if only_teams is not None:
+        only_teams = {t.upper() for t in only_teams}
+
     # Ensure ORtg/DRtg/Pace/NetRtg columns exist in Team_ratings
     for col in ["ORtg", "DRtg", "Pace", "NetRtg"]:
         if col not in tr.columns:
@@ -220,6 +267,9 @@ def update_team_ratings(team_ratings_path: str, season: str) -> None:
     updated_rows = 0
     for idx, row in tr.iterrows():
         abbr = str(row["Team"]).upper()
+        # If only_teams specified, skip others
+        if only_teams is not None and abbr not in only_teams:
+            continue
         if abbr not in adv_map:
             # Uncomment if you want to see which teams didn't match
             # print(f"[WARN] No advanced stats for Team '{abbr}'")
@@ -243,7 +293,11 @@ def update_team_ratings(team_ratings_path: str, season: str) -> None:
     tr.to_csv(team_ratings_path, index=False)
 
 
-def update_players_onoff(csv_path: str, season: str):
+def update_players_onoff(
+    csv_path: str,
+    season: str,
+    only_teams: Optional[Set[str]] = None,
+):
     """
     Update players_onoff.csv with LastGameDate and DaysSinceLastGame
     using nba_api PlayerGameLog.
@@ -255,6 +309,9 @@ def update_players_onoff(csv_path: str, season: str):
     print(f"Loading players_onoff from {csv_path} ...")
     df = pd.read_csv(csv_path)
     df["Team"] = df["Team"].str.upper()
+
+    if only_teams is not None:
+        only_teams = {t.upper() for t in only_teams}
 
     # Ensure columns exist
     if "LastGameDate" not in df.columns:
@@ -280,7 +337,19 @@ def update_players_onoff(csv_path: str, season: str):
     print(f"Processing {len(df)} players ...")
     for _, row in df.iterrows():
         name = str(row["Player"])
+        team_abbr = str(row["Team"]).upper()
         last_update = str(row.get("LastUpdateDate", "") or "")
+
+        # Skip players whose team is not in today's slate (if filter provided)
+        if only_teams is not None and team_abbr not in only_teams:
+            # Keep existing values for this row
+            new_last_dates.append(str(row.get("LastGameDate", "") or ""))
+            try:
+                new_days_since.append(float(row.get("DaysSinceLastGame", np.nan)))
+            except Exception:
+                new_days_since.append(np.nan)
+            new_update_dates.append(str(row.get("LastUpdateDate", "") or ""))
+            continue
 
         # --- SKIP if we already updated this row today ---
         if last_update == today_str:
@@ -361,9 +430,28 @@ def main():
     print(f"Season: {SEASON}")
     print()
 
-    update_team_ratings(TEAM_RATINGS_CSV, SEASON)
-    print()
-    update_players_onoff(PLAYERS_ONOFF_CSV, SEASON)
+    import sys
+
+    mode = "full"
+    if len(sys.argv) > 1:
+        mode = sys.argv[1].lower()
+
+    if mode == "slate":
+        print("[mode] Slate-only update (today's games).")
+        slate_teams = fetch_today_slate_teams()
+        if not slate_teams:
+            print("No slate teams found; nothing to update.")
+            return
+
+        update_team_ratings(TEAM_RATINGS_CSV, SEASON, only_teams=slate_teams)
+        print()
+        update_players_onoff(PLAYERS_ONOFF_CSV, SEASON, only_teams=slate_teams)
+
+    else:
+        print("[mode] Full update (all teams + all players).")
+        update_team_ratings(TEAM_RATINGS_CSV, SEASON)
+        print()
+        update_players_onoff(PLAYERS_ONOFF_CSV, SEASON)
 
     print("\nDone. You can now re-run your Streamlit app using the refreshed CSVs.")
 
