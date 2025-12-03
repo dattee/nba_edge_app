@@ -1909,7 +1909,7 @@ with tab_slate:
                 st.write(f"**Model edge (hybrid):** {edge:.2f} pts")
             st.write(f"**Confidence:** {conf}")
 
-            # Players who were out at log time (from logs.home_out / away_out)
+            # Players who were out at log time (from logs.home_out / logs.away_out)
             home_out = row.get("home_out", None)
             away_out = row.get("away_out", None)
             outs_parts = []
@@ -2244,6 +2244,17 @@ with tab_logs:
                                 st.write(f"**Vegas line at time:** {row['vegas_line']:+.1f}")
                             st.write(f"**Model edge:** {edge:.2f} pts")
                             st.write(f"**Confidence:** {conf}")
+
+                            # Players who were out at log time (from logs.home_out / logs.away_out)
+                            home_out = row.get("home_out", None)
+                            away_out = row.get("away_out", None)
+                            outs_parts = []
+                            if home_out:
+                                outs_parts.append(f"{fav} outs: {home_out}")
+                            if away_out:
+                                outs_parts.append(f"{dog} outs: {away_out}")
+                            if outs_parts:
+                                st.write("**Players out at log time:** " + " | ".join(outs_parts))
 
                             # Cheatsheet vs hybrid at log time
                             cheat_edge_row = row.get("cheat_edge", None)
