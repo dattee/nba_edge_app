@@ -1159,20 +1159,10 @@ with tab_single:
         st.session_state["away_rest_profile"] = away_rest
         st.caption("Schedule info unavailable (manual mode).")
     
-    # =========================
-    # Spread + Score Inputs
-    # =========================
-    st.subheader("Spread + Score Inputs")
-
-    colA, colB, colC = st.columns(3)
-    with colA:
-        favorite = st.text_input("Favorite Team (abbr)", value=favorite_abbr)
-    with colB:
-        underdog = st.text_input("Underdog Team (abbr)", value=underdog_abbr)
-    with colC:
-        vegas_line = st.number_input(
-            "Vegas Spread (favorite only)", step=0.5, value=float(vegas_line)
-        )
+    # Spread + Score Inputs are now taken directly from the game / manual selection
+    favorite = favorite_abbr
+    underdog = underdog_abbr
+    # vegas_line is already defined earlier from odds or manual input
 
     # =========================
     # Cheatsheet hook for THIS game + Stat model inputs
