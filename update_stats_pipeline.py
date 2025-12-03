@@ -92,21 +92,18 @@ def fetch_team_advanced_stats(season: str) -> pd.DataFrame:
 
 
 def fetch_today_slate_teams(game_date: Optional[datetime.date] = None) -> Set[str]:
-    """
-    Use nba_api Scoreboard to get today's slate and return a set of
-    team abbreviations (e.g. {'ORL', 'SAS', ...}).
-    """
-    from nba_api.stats.endpoints import scoreboard
+    # Use scoreboardv2 instead of scoreboard
+    from nba_api.stats.endpoints import scoreboardv2
     from nba_api.stats.static import teams as static_teams
 
     if game_date is None:
         game_date = datetime.date.today()
 
     date_str = game_date.strftime("%m/%d/%Y")
-
     print(f"Fetching scoreboard for {date_str} ...")
-    sb = scoreboard.Scoreboard(game_date=date_str, league_id="00", day_offset=0)
 
+    # ScoreboardV2 returns game header + other tables
+    sb = scoreboardv2.ScoreboardV2(game_date=date_str, league_id="00", day_offset=0)
     games = sb.game_header.get_data_frame()
     if games.empty:
         print("No games found on scoreboard for this date.")
@@ -128,6 +125,7 @@ def fetch_today_slate_teams(game_date: Optional[datetime.date] = None) -> Set[st
 
     print(f"Today's slate teams: {', '.join(sorted(slate))}")
     return slate
+
     
 # Map CSV names -> canonical names when they genuinely differ.
 # Example: your CSV might say "Cameron Thomas" but NBA uses "Cam Thomas".
@@ -293,6 +291,8 @@ def update_team_ratings(
     tr.to_csv(team_ratings_path, index=False)
 
 
+from typing import Optional, Dict, Set  # make sure Set is imported at top
+
 def update_players_onoff(
     csv_path: str,
     season: str,
@@ -305,11 +305,14 @@ def update_players_onoff(
     - Resolves player_id by normalized name (handles accents, Jr, aliases).
     - If no ID or error: leaves LastGameDate blank and DaysSinceLastGame as NaN.
     - Skips players that were already updated today (LastUpdateDate == today).
+    - If only_teams is provided, only players on those teams are refreshed;
+      others keep their existing values.
     """
     print(f"Loading players_onoff from {csv_path} ...")
     df = pd.read_csv(csv_path)
     df["Team"] = df["Team"].str.upper()
 
+    # Normalize filter set
     if only_teams is not None:
         only_teams = {t.upper() for t in only_teams}
 
@@ -323,68 +326,81 @@ def update_players_onoff(
 
     # Build normalized name -> id lookup once
     print("Building player name lookup (normalized) ...")
-    name_lookup = build_player_lookup()
-
-    from nba_api.stats.endpoints import playergamelog
+    name_to_id = build_player_lookup()
 
     today = datetime.date.today()
     today_str = today.isoformat()
 
-    new_last_dates: list[str] = []
-    new_days_since: list[float] = []
-    new_update_dates: list[str] = []
+    new_last_dates = []
+    new_days_since = []
+    new_update_dates = []
 
-    print(f"Processing {len(df)} players ...")
+    # Count how many we will actually process
+    if only_teams is not None:
+        to_process = df["Team"].isin(only_teams).sum()
+        print(f"Processing {to_process} players (filtered to slate teams).")
+    else:
+        print(f"Processing {len(df)} players ...")
+
     for _, row in df.iterrows():
-        name = str(row["Player"])
+        name = row["Player"]
         team_abbr = str(row["Team"]).upper()
-        last_update = str(row.get("LastUpdateDate", "") or "")
 
-        # Skip players whose team is not in today's slate (if filter provided)
+        last_update = str(row.get("LastUpdateDate", "") or "")
+        # If this player is not on a slate team, just carry forward existing values
         if only_teams is not None and team_abbr not in only_teams:
-            # Keep existing values for this row
             new_last_dates.append(str(row.get("LastGameDate", "") or ""))
             try:
                 new_days_since.append(float(row.get("DaysSinceLastGame", np.nan)))
             except Exception:
                 new_days_since.append(np.nan)
-            new_update_dates.append(str(row.get("LastUpdateDate", "") or ""))
+            new_update_dates.append(last_update)
             continue
 
-        # --- SKIP if we already updated this row today ---
-        if last_update == today_str:
-            new_last_dates.append(str(row["LastGameDate"] or ""))
+        # Skip API call if player was updated within the last N days (including today)
+        SKIP_DAYS = 3
+        recently_updated = False
+        if last_update:
             try:
-                new_days_since.append(float(row["DaysSinceLastGame"]))
+                last_dt = datetime.date.fromisoformat(last_update)
+                delta_days = (today - last_dt).days
+                if delta_days >= 0 and delta_days <= SKIP_DAYS:
+                    recently_updated = True
+            except Exception:
+                recently_updated = False
+
+        if recently_updated:
+            new_last_dates.append(str(row.get("LastGameDate", "") or ""))
+            try:
+                new_days_since.append(float(row.get("DaysSinceLastGame", np.nan)))
             except Exception:
                 new_days_since.append(np.nan)
             new_update_dates.append(last_update)
-            print(f"  -> {name}: already updated today, skipping.")
             continue
 
-        # Resolve player id using normalized names
-        pid = find_player_id_by_name(name, name_lookup)
+        norm_name = normalize_name(name)
+        player_id = name_to_id.get(norm_name)
 
-        if not pid:
-            print(
-                f"  -> no NBA ID found for '{name}' "
-                f"(normalized: '{normalize_name(name)}'), skipping API call."
-            )
-            new_last_dates.append(str(row["LastGameDate"] or ""))
+        if player_id is None:
+            print(f"[WARN] Could not resolve id for player '{name}' (norm='{norm_name}')")
+            new_last_dates.append(str(row.get("LastGameDate", "") or ""))
             try:
-                new_days_since.append(float(row["DaysSinceLastGame"]))
+                new_days_since.append(float(row.get("DaysSinceLastGame", np.nan)))
             except Exception:
                 new_days_since.append(np.nan)
             new_update_dates.append(last_update)
             continue
 
         try:
-            gl = playergamelog.PlayerGameLog(player_id=pid, season=season)
-            gl_dict = gl.get_normalized_dict()
-            games = gl_dict.get("PlayerGameLog", [])
-
-            if not games:
-                print(f"  -> no games logged for '{name}' in {season}.")
+            print(f"Fetching game log for {name} ({team_abbr}) ...")
+            gl = playergamelog.PlayerGameLog(
+                player_id=player_id,
+                season=season,
+                season_type_all_star="Regular Season",
+            )
+            games = gl.get_data_frames()[0]
+            if games.empty:
+                print(f"  -> no games found for {name} in {season}")
                 new_last_dates.append("")
                 new_days_since.append(np.nan)
                 new_update_dates.append(today_str)
@@ -403,9 +419,9 @@ def update_players_onoff(
 
         except Exception as e:
             print(f"  -> error fetching log for '{name}': {e}")
-            new_last_dates.append(str(row["LastGameDate"] or ""))
+            new_last_dates.append(str(row.get("LastGameDate", "") or ""))
             try:
-                new_days_since.append(float(row["DaysSinceLastGame"]))
+                new_days_since.append(float(row.get("DaysSinceLastGame", np.nan)))
             except Exception:
                 new_days_since.append(np.nan)
             new_update_dates.append(last_update)
@@ -424,6 +440,7 @@ def update_players_onoff(
     df.to_csv(csv_path, index=False)
     print("Done updating players_onoff.")
 
+
 def main():
     _ensure_nba_api()
     print("=== NBA Edge Analyzer Stats Pipeline ===")
@@ -431,7 +448,6 @@ def main():
     print()
 
     import sys
-
     mode = "full"
     if len(sys.argv) > 1:
         mode = sys.argv[1].lower()
@@ -458,3 +474,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
