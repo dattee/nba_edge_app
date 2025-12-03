@@ -173,6 +173,18 @@ with engine.connect() as conn:
     if "ctg_summary" not in col_names:
         conn.execute(text("ALTER TABLE logs ADD COLUMN ctg_summary TEXT"))
 
+    # B2B flags for each team
+    if "fav_is_b2b" not in col_names:
+        conn.execute(text("ALTER TABLE logs ADD COLUMN fav_is_b2b INTEGER"))
+    if "dog_is_b2b" not in col_names:
+        conn.execute(text("ALTER TABLE logs ADD COLUMN dog_is_b2b INTEGER"))
+
+    # Injury / outs snapshot
+    if "home_out" not in col_names:
+        conn.execute(text("ALTER TABLE logs ADD COLUMN home_out TEXT"))
+    if "away_out" not in col_names:
+        conn.execute(text("ALTER TABLE logs ADD COLUMN away_out TEXT"))
+
 # =========================
 # Log loading helper
 # =========================
@@ -1726,6 +1738,8 @@ with tab_single:
                         "dog_drtg": dog_drtg,
                         "fav_netr": fav_netr,
                         "dog_netr": dog_netr,
+                        "home_out": ", ".join(home_out) if home_out else None,
+                        "away_out": ", ".join(away_out) if away_out else None,
                         "cheat_edge": cheat_edge,
                         "cheat_pick": cheat_pick,
                         "models_aligned": 1 if aligned else 0,
@@ -1894,6 +1908,17 @@ with tab_slate:
             if edge is not None:
                 st.write(f"**Model edge (hybrid):** {edge:.2f} pts")
             st.write(f"**Confidence:** {conf}")
+
+            # Players who were out at log time (from logs.home_out / away_out)
+            home_out = row.get("home_out", None)
+            away_out = row.get("away_out", None)
+            outs_parts = []
+            if home_out:
+                outs_parts.append(f"{fav} outs: {home_out}")
+            if away_out:
+                outs_parts.append(f"{dog} outs: {away_out}")
+            if outs_parts:
+                st.write("**Players out at log time:** " + " | ".join(outs_parts))
 
             if fs:
                 if cov == 1:
