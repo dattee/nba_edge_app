@@ -2854,6 +2854,13 @@ with tab_logs:
                 st.write("You selected:", selected_label)
 
                 confirm_key = "delete_pick_confirm"
+                reset_flag_key = "delete_pick_confirm_reset"
+
+                # Before drawing the checkbox, check if we need to reset it
+                if st.session_state.get(reset_flag_key, False):
+                    # Remove the old checkbox state so it comes back unchecked
+                    st.session_state.pop(confirm_key, None)
+                    st.session_state[reset_flag_key] = False
 
                 confirm = st.checkbox(
                     "I understand this will permanently delete this pick from the log, "
@@ -2861,9 +2868,7 @@ with tab_logs:
                     key=confirm_key,
                 )
 
-                if st.button(
-                    "Delete selected pick", type="primary", disabled=not confirm
-                ):
+                if st.button("Delete selected pick", type="primary", disabled=not confirm):
                     delete_pick_by_id(selected_id)
 
                     # Clear cached logs if using st.cache_data
@@ -2872,8 +2877,8 @@ with tab_logs:
                     except Exception:
                         pass
 
-                    # Reset confirmation checkbox so it appears unchecked after rerun
-                    st.session_state[confirm_key] = False
+                    # On the next rerun, clear the checkbox state
+                    st.session_state[reset_flag_key] = True
 
                     st.success(f"Deleted pick with id {selected_id}.")
 
