@@ -2683,83 +2683,6 @@ with tab_logs:
         if logs.empty:
             st.info("No logs yet.")
         else:
-            st.subheader("Delete a Logged Pick")
-
-            if logs_df is None or logs_df.empty:
-                st.info("No logged picks available to delete.")
-            else:
-                df_for_select = logs_df.copy()
-
-                def _build_label(row):
-                    date_str = str(row.get("date", ""))
-                    fav = row.get("favorite", "")
-                    dog = row.get("underdog", "")
-                    pick = row.get("pick", "")
-                    edge = row.get("edge", None)
-                    edge_str = (
-                        f"{edge:.2f}" if isinstance(edge, (int, float)) else str(edge)
-                    )
-                    return (
-                        f"[id {row['id']}] {date_str} – {fav} vs {dog} – "
-                        f"Pick: {pick} – Edge: {edge_str}"
-                    )
-
-                df_for_select["label"] = df_for_select.apply(_build_label, axis=1)
-
-                # Default selection can be the last row (most recent)
-                default_index = len(df_for_select) - 1
-
-                selected_label = st.selectbox(
-                    "Select a pick to delete:",
-                    options=df_for_select["label"].tolist(),
-                    index=default_index,
-                )
-
-                selected_row = df_for_select[
-                    df_for_select["label"] == selected_label
-                ].iloc[0]
-                selected_id = int(selected_row["id"])
-
-                st.write("You selected:", selected_label)
-
-                confirm = st.checkbox(
-                    "I understand this will permanently delete this pick from the log, "
-                    "Per-Game Detail, and CTG views."
-                )
-
-                if st.button(
-                    "Delete selected pick", type="primary", disabled=not confirm
-                ):
-                    delete_pick_by_id(selected_id)
-
-                    try:
-                        load_all_logs.clear()
-                    except Exception:
-                        pass
-
-                    st.success(f"Deleted pick with id {selected_id}.")
-                    st.experimental_rerun()
-
-            st.subheader("Quick Delete – Last Logged Pick")
-
-            if logs_df is None or logs_df.empty:
-                st.info("No logged picks to delete.")
-            else:
-                last_id = int(logs_df["id"].max())
-                last_row = logs_df[logs_df["id"] == last_id].iloc[0]
-                last_label = _build_label(last_row)
-
-                st.write("Last logged pick:", last_label)
-
-                if st.button("Delete last logged pick"):
-                    delete_pick_by_id(last_id)
-                    try:
-                        load_all_logs.clear()
-                    except Exception:
-                        pass
-                    st.success(f"Deleted last pick (id {last_id}).")
-                    st.experimental_rerun()
-
             # -------- MAIN TABLE WITH DATE SEPARATORS --------
             display_logs = logs.copy()
 
@@ -2884,6 +2807,75 @@ with tab_logs:
             )
 
             st.dataframe(styled_table, use_container_width=True, hide_index=True)
+
+            st.subheader("Delete a Logged Pick")
+
+            if logs_df is None or logs_df.empty:
+                st.info("No logged picks available to delete.")
+            else:
+                df_for_select = logs_df.copy()
+
+                # Sort newest-to-oldest so the latest pick is first in the dropdown
+                if "id" in df_for_select.columns:
+                    df_for_select = df_for_select.sort_values("id", ascending=False)
+                elif "date" in df_for_select.columns:
+                    df_for_select = df_for_select.sort_values("date", ascending=False)
+
+                def _build_label(row):
+                    date_str = str(row.get("date", ""))
+                    fav = row.get("favorite", "")
+                    dog = row.get("underdog", "")
+                    pick = row.get("pick", "")
+                    edge = row.get("edge", None)
+                    edge_str = (
+                        f"{edge:.2f}" if isinstance(edge, (int, float)) else str(edge)
+                    )
+                    return (
+                        f"[id {row['id']}] {date_str} – {fav} vs {dog} – "
+                        f"Pick: {pick} – Edge: {edge_str}"
+                    )
+
+                df_for_select["label"] = df_for_select.apply(_build_label, axis=1)
+
+                # Default to the most recent pick
+                default_index = 0 if len(df_for_select) > 0 else None
+
+                selected_label = st.selectbox(
+                    "Select a pick to delete:",
+                    options=df_for_select["label"].tolist(),
+                    index=default_index,
+                )
+
+                selected_row = df_for_select[
+                    df_for_select["label"] == selected_label
+                ].iloc[0]
+                selected_id = int(selected_row["id"])
+
+                st.write("You selected:", selected_label)
+
+                confirm = st.checkbox(
+                    "I understand this will permanently delete this pick from the log, "
+                    "Per-Game Detail, and CTG views."
+                )
+
+                if st.button(
+                    "Delete selected pick", type="primary", disabled=not confirm
+                ):
+                    delete_pick_by_id(selected_id)
+
+                    # Clear cached logs if using st.cache_data
+                    try:
+                        load_all_logs.clear()
+                    except Exception:
+                        pass
+
+                    st.success(f"Deleted pick with id {selected_id}.")
+
+                    # Rerun app so the deleted row disappears from all views
+                    try:
+                        st.rerun()
+                    except Exception:
+                        pass
 
             # -------- PER-GAME DETAILS, GROUPED BY DATE --------
             st.markdown("### 🔍 Per-Game Details (Pace / Ratings Tags)")
