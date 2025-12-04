@@ -1,3 +1,4 @@
+import math
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,7 +10,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import create_engine, text
 import pdfplumber
 from dotenv import load_dotenv
-from openai import OpenAI  
+from openai import OpenAI
 
 # Load environment variables from .env
 load_dotenv()
@@ -192,6 +193,28 @@ with engine.connect() as conn:
     if "away_out" not in col_names:
         conn.execute(text("ALTER TABLE logs ADD COLUMN away_out TEXT"))
 
+    # Injury impact snapshots
+    injury_cols = {
+        "player_adj_raw": "REAL",
+        "fav_player_adj_raw": "REAL",
+        "dog_player_adj_raw": "REAL",
+        "effective_player_adj": "REAL",
+        "fav_effective_player_adj": "REAL",
+        "dog_effective_player_adj": "REAL",
+        "injury_impact_flag": "TEXT",
+        "injury_heavy": "INTEGER",
+        "fav_injury_impact_flag": "TEXT",
+        "dog_injury_impact_flag": "TEXT",
+        "fav_injury_heavy": "INTEGER",
+        "dog_injury_heavy": "INTEGER",
+    }
+    for ic, col_type in injury_cols.items():
+        if ic not in col_names:
+            try:
+                conn.execute(text(f"ALTER TABLE logs ADD COLUMN {ic} {col_type}"))
+            except Exception:
+                pass
+
 # =========================
 # Log loading helper
 # =========================
@@ -282,6 +305,126 @@ def get_team_metric(team_abbr: str, col_candidates: list[str]):
 # =========================
 # Helper Functions
 # =========================
+def compute_player_injury_terms(out_players, players_df, injury_cap=6.0):
+    """
+    Compute raw and effective injury adjustment plus flags.
+
+    Parameters
+    ----------
+    out_players : list[str]
+        List of player names selected as OUT for this team.
+    players_df : pd.DataFrame
+        DataFrame with at least: ['Player', 'Diff', 'DaysSinceLastGame'].
+    injury_cap : float
+        Hard cap (in points) for the absolute effective injury adjustment.
+
+    Returns
+    -------
+    player_adj_raw : float
+        Sum of recency-weighted on/off Diffs for all OUT players.
+    player_adj_eff_capped : float
+        Effective injury adjustment after existing transform (if any) and hard cap.
+        NOTE: the transformation from raw → effective is done outside this function;
+              this helper only handles recency weighting and capping.
+    injury_impact_flag : str
+        One of {"low", "medium", "high"} based on |player_adj_eff_capped|.
+    injury_heavy : int
+        1 if |player_adj_eff_capped| >= 4.0, else 0.
+    """
+    if not out_players:
+        return 0.0, 0.0, "low", 0
+
+    # Make sure we have the columns we need
+    cols = players_df.columns
+    if "Player" not in cols or "Diff" not in cols:
+        return 0.0, 0.0, "low", 0
+
+    # DaysSinceLastGame is optional but preferred
+    has_days = "DaysSinceLastGame" in cols
+
+    player_adj_raw = 0.0
+
+    for name in out_players:
+        row = players_df.loc[players_df["Player"] == name]
+        if row.empty:
+            continue
+
+        diff = row["Diff"].iloc[0]
+        try:
+            diff = float(diff)
+        except (TypeError, ValueError):
+            diff = 0.0
+
+        days = None
+        if has_days:
+            days = row["DaysSinceLastGame"].iloc[0]
+
+        # Recency-based weight
+        if days is None or (isinstance(days, float) and math.isnan(days)):
+            w_recency = 1.0
+        else:
+            try:
+                d = float(days)
+            except (TypeError, ValueError):
+                d = 0.0
+
+            if d <= 3:
+                w_recency = 1.0      # fresh absence
+            elif d <= 7:
+                w_recency = 0.7      # ~1–3 games missed
+            elif d <= 14:
+                w_recency = 0.4      # ~3–5+ games missed
+            else:
+                w_recency = 0.0      # long-term out → already baked into line/ratings
+
+        player_adj_raw += diff * w_recency
+
+    # NOTE: DO NOT apply transform here.
+    # The caller should:
+    #   1) convert player_adj_raw → effective_player_adj (existing logic)
+    #   2) then apply the cap and flags using the helper below.
+    #
+    # So we only return the raw here; the caller will pass the effective value
+    # back into another helper that applies the cap & flags.
+    return player_adj_raw, 0.0, "low", 0
+
+
+def cap_and_flag_injury_effect(effective_player_adj, injury_cap=6.0):
+    """
+    Apply a hard cap to the effective injury adjustment and
+    compute injury_impact_flag and injury_heavy.
+
+    Returns
+    -------
+    player_adj_eff_capped : float
+    injury_impact_flag : str  # "low" / "medium" / "high"
+    injury_heavy : int        # 1 if high, else 0
+    """
+    # Hard cap
+    if effective_player_adj is None:
+        effective_player_adj = 0.0
+
+    try:
+        eff = float(effective_player_adj)
+    except (TypeError, ValueError):
+        eff = 0.0
+
+    player_adj_eff_capped = max(min(eff, injury_cap), -injury_cap)
+    abs_injury = abs(player_adj_eff_capped)
+
+    if abs_injury < 2.0:
+        injury_impact_flag = "low"
+        injury_heavy = 0
+    elif abs_injury < 4.0:
+        injury_impact_flag = "medium"
+        injury_heavy = 0
+    else:
+        injury_impact_flag = "high"
+        injury_heavy = 1
+
+    return player_adj_eff_capped, injury_impact_flag, injury_heavy
+
+
 def classify_edge(val: float) -> str:
     if val > STRONG_EDGE:
         return "STRONG"
@@ -1333,33 +1476,45 @@ with tab_single:
         cheat_pick = side_to_pick(cheat_side, favorite, underdog, vegas_line)
 
         # --- Player Impact ---
-        player_adj = 0.0
-        for p in home_out:
-            row = players_df[
-                (players_df["Player"] == p) & (players_df["Team"] == home_abbr)
-            ]
-            if not row.empty:
-                diff_val = float(row["Diff"].iloc[0])
-                player_adj += -diff_val if favorite.upper() == home_abbr else diff_val
+        fav_is_home = favorite.upper() == home_abbr
 
-        for p in away_out:
-            row = players_df[
-                (players_df["Player"] == p) & (players_df["Team"] == away_abbr)
-            ]
-            if not row.empty:
-                diff_val = float(row["Diff"].iloc[0])
-                player_adj += -diff_val if favorite.upper() == away_abbr else diff_val
+        fav_out_players = home_out if fav_is_home else away_out
+        dog_out_players = away_out if fav_is_home else home_out
 
-        abs_player = abs(player_adj)
-        if abs_player == 0:
-            effective_player_adj = 0.0
-        else:
-            effective_player_adj = abs_player + (
+        fav_player_adj_raw, _, _, _ = compute_player_injury_terms(
+            out_players=fav_out_players, players_df=players_df
+        )
+        dog_player_adj_raw, _, _, _ = compute_player_injury_terms(
+            out_players=dog_out_players, players_df=players_df
+        )
+
+        def transform_player_adj(val: float) -> float:
+            abs_player = abs(val)
+            if abs_player == 0:
+                return 0.0
+            eff_val = abs_player + (
                 abs_player * (abs_player / (abs_player + (K5 * 2)))
             )
-            effective_player_adj = (
-                -effective_player_adj if player_adj < 0 else effective_player_adj
-            )
+            return -eff_val if val < 0 else eff_val
+
+        fav_effective_player_adj_raw = transform_player_adj(-fav_player_adj_raw)
+        dog_effective_player_adj_raw = transform_player_adj(dog_player_adj_raw)
+
+        fav_effective_player_adj, fav_injury_flag, fav_injury_heavy = cap_and_flag_injury_effect(
+            fav_effective_player_adj_raw, injury_cap=6.0
+        )
+        dog_effective_player_adj, dog_injury_flag, dog_injury_heavy = cap_and_flag_injury_effect(
+            dog_effective_player_adj_raw, injury_cap=6.0
+        )
+
+        player_adj = dog_player_adj_raw - fav_player_adj_raw
+        effective_player_adj = dog_effective_player_adj + fav_effective_player_adj
+
+        injury_heavy = 1 if (fav_injury_heavy or dog_injury_heavy) else 0
+        flag_order = ["low", "medium", "high"]
+        fav_rank = flag_order.index(fav_injury_flag) if fav_injury_flag in flag_order else 0
+        dog_rank = flag_order.index(dog_injury_flag) if dog_injury_flag in flag_order else 0
+        injury_impact_flag = flag_order[max(fav_rank, dog_rank)]
 
         # --- Team Strength ---
         if TEAM_RATINGS_AVAILABLE:
@@ -1524,7 +1679,18 @@ with tab_single:
                 "stat_margin": float(stat_margin),
                 "vegas_margin": float(vegas_margin),
                 "player_adj": float(player_adj),
+                "player_adj_raw": float(player_adj),
+                "fav_player_adj_raw": float(fav_player_adj_raw),
+                "dog_player_adj_raw": float(dog_player_adj_raw),
                 "effective_player_adj": float(effective_player_adj),
+                "fav_effective_player_adj": float(fav_effective_player_adj),
+                "dog_effective_player_adj": float(dog_effective_player_adj),
+                "injury_impact_flag": injury_impact_flag,
+                "fav_injury_impact_flag": fav_injury_flag,
+                "dog_injury_impact_flag": dog_injury_flag,
+                "injury_heavy": int(injury_heavy),
+                "fav_injury_heavy": int(fav_injury_heavy),
+                "dog_injury_heavy": int(dog_injury_heavy),
                 "home_power": home_power,
                 "away_power": away_power,
                 "fav_team_margin_combined": float(fav_team_margin_combined),
@@ -1574,6 +1740,17 @@ with tab_single:
         vegas_margin = st.session_state["vegas_margin"]
         player_adj = st.session_state["player_adj"]
         effective_player_adj = st.session_state["effective_player_adj"]
+        player_adj_raw = st.session_state.get("player_adj_raw", player_adj)
+        fav_player_adj_raw = st.session_state.get("fav_player_adj_raw", 0.0)
+        dog_player_adj_raw = st.session_state.get("dog_player_adj_raw", 0.0)
+        fav_effective_player_adj = st.session_state.get("fav_effective_player_adj", 0.0)
+        dog_effective_player_adj = st.session_state.get("dog_effective_player_adj", 0.0)
+        injury_impact_flag = st.session_state.get("injury_impact_flag", "low")
+        injury_heavy = st.session_state.get("injury_heavy", 0)
+        fav_injury_impact_flag = st.session_state.get("fav_injury_impact_flag", "low")
+        dog_injury_impact_flag = st.session_state.get("dog_injury_impact_flag", "low")
+        fav_injury_heavy = st.session_state.get("fav_injury_heavy", 0)
+        dog_injury_heavy = st.session_state.get("dog_injury_heavy", 0)
         home_power = st.session_state["home_power"]
         away_power = st.session_state["away_power"]
         fav_team_margin_combined = st.session_state["fav_team_margin_combined"]
@@ -1639,8 +1816,19 @@ with tab_single:
 
         with model_cols[1]:
             st.markdown("### Player Impact Detail")
-            st.write(f"Raw Player Adj (fav perspective): **{player_adj:.2f}**")
-            st.write(f"Effective Player Adj (curved): **{effective_player_adj:.2f}**")
+            st.write(
+                f"Raw Player Adj (fav perspective, recency-weighted): **{player_adj_raw:.2f}**"
+            )
+            st.write(
+                f"Effective Player Adj (curved & capped): **{effective_player_adj:.2f}** "
+                f"({injury_impact_flag}, heavy={injury_heavy})"
+            )
+            st.write(
+                f"Fav outs adj: **{fav_effective_player_adj:.2f}** (raw {-fav_player_adj_raw:.2f})"
+            )
+            st.write(
+                f"Dog outs adj: **{dog_effective_player_adj:.2f}** (raw {dog_player_adj_raw:.2f})"
+            )
             st.write(f"{home_abbr} outs: {', '.join(home_out) if home_out else 'None'}")
             st.write(f"{away_abbr} outs: {', '.join(away_out) if away_out else 'None'}")
 
@@ -1764,6 +1952,18 @@ with tab_single:
                         "cheat_pick": cheat_pick,
                         "models_aligned": 1 if aligned else 0,
                         "hybrid_pick": hybrid_pick,
+                        "player_adj_raw": player_adj_raw,
+                        "fav_player_adj_raw": fav_player_adj_raw,
+                        "dog_player_adj_raw": dog_player_adj_raw,
+                        "effective_player_adj": effective_player_adj,
+                        "fav_effective_player_adj": fav_effective_player_adj,
+                        "dog_effective_player_adj": dog_effective_player_adj,
+                        "injury_impact_flag": injury_impact_flag,
+                        "injury_heavy": injury_heavy,
+                        "fav_injury_impact_flag": fav_injury_impact_flag,
+                        "dog_injury_impact_flag": dog_injury_impact_flag,
+                        "fav_injury_heavy": fav_injury_heavy,
+                        "dog_injury_heavy": dog_injury_heavy,
                         # components for weight learning
                         "stat_margin": st.session_state.get("stat_margin"),
                         "team_margin": st.session_state.get("fav_team_margin_combined"),
@@ -2081,6 +2281,45 @@ with tab_perf:
                     )
 
                 st.table(pd.DataFrame(aligned_rows))
+
+            # ---------------- INJURY HEAVY CONTEXT ----------------
+            if "injury_heavy" in df.columns:
+                st.markdown("### Injury Heavy Context")
+
+                def summarize_injury(label, mask):
+                    sub = df[mask]
+                    if sub.empty:
+                        return {
+                            "Group": label,
+                            "N": 0,
+                            "Wins": 0,
+                            "Losses": 0,
+                            "Pushes": 0,
+                            "Win%": None,
+                            "Avg edge": None,
+                        }
+                    N = len(sub)
+                    W = (sub["spread_covered"] == 1).sum()
+                    L = (sub["spread_covered"] == 0).sum()
+                    P = (sub["spread_covered"] == 2).sum()
+                    effN = N - P
+                    winp = (W / effN * 100.0) if effN > 0 else None
+                    avg_e = float(sub["edge"].mean())
+                    return {
+                        "Group": label,
+                        "N": N,
+                        "Wins": W,
+                        "Losses": L,
+                        "Pushes": P,
+                        "Win%": round(winp, 1) if winp is not None else None,
+                        "Avg edge": round(avg_e, 2),
+                    }
+
+                injury_rows = [
+                    summarize_injury("Injury heavy (1)", df["injury_heavy"] == 1),
+                    summarize_injury("Not heavy (0)", df["injury_heavy"] != 1),
+                ]
+                st.table(pd.DataFrame(injury_rows))
 
             # ---------------- B2B CONTEXT (if available) ----------------
             if "fav_is_b2b" in df.columns and "dog_is_b2b" in df.columns:
