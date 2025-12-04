@@ -2142,19 +2142,33 @@ with tab_perf:
                 "No graded picks yet. Use 'Refresh Final Scores' in Prediction Log after games complete."
             )
         else:
-            # ---------------- OVERALL SUMMARY ----------------
-            st.markdown("### Overall")
-
+            # ---------------- SNAPSHOT METRICS ----------------
             total = len(df)
             wins = (df["spread_covered"] == 1).sum()
             losses = (df["spread_covered"] == 0).sum()
             pushes = (df["spread_covered"] == 2).sum()
             eff = total - pushes
 
-            avg_edge = float(df["edge"].mean()) if "edge" in df.columns else float(
-                "nan"
-            )
+            avg_edge = float(df["edge"].mean()) if "edge" in df.columns else float("nan")
             win_pct = (wins / eff * 100.0) if eff > 0 else float("nan")
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total picks", total)
+            with col2:
+                st.metric("Win% (graded)", f"{win_pct:.1f}%" if eff > 0 else "—")
+            with col3:
+                st.metric(
+                    "Avg edge (pts)",
+                    f"{avg_edge:.2f}" if not pd.isna(avg_edge) else "—",
+                )
+            with col4:
+                st.metric("Eff. picks (W+L)", eff)
+
+            st.markdown("---")
+
+            # ---------------- 1. OVERALL SUMMARY TABLE ----------------
+            st.markdown("### 1. Overall Results")
 
             overall_df = pd.DataFrame(
                 [
@@ -2165,17 +2179,17 @@ with tab_perf:
                         "Losses": losses,
                         "Pushes": pushes,
                         "Win%": round(win_pct, 1) if eff > 0 else None,
-                        "Avg edge": round(avg_edge, 2)
+                        "Avg edge (pts)": round(avg_edge, 2)
                         if not pd.isna(avg_edge)
                         else None,
                     }
                 ]
             )
-            st.table(overall_df)
+            st.dataframe(overall_df, use_container_width=True)
 
-            # ---------------- EDGE BUCKETS ----------------
+            # ---------------- 2. EDGE BUCKETS ----------------
             if "edge" in df.columns:
-                st.markdown("### Performance by Edge Bucket (|edge|)")
+                st.markdown("### 2. Performance by Edge Bucket (|edge|)")
 
                 dfe = df.copy()
                 dfe["abs_edge"] = dfe["edge"].abs()
@@ -2185,12 +2199,12 @@ with tab_perf:
                     if sub.empty:
                         return {
                             "Bucket": name,
-                            "N": 0,
+                            "Picks": 0,
                             "Wins": 0,
                             "Losses": 0,
                             "Pushes": 0,
                             "Win%": None,
-                            "Avg edge": None,
+                            "Avg edge (pts)": None,
                         }
                     N = len(sub)
                     W = (sub["spread_covered"] == 1).sum()
@@ -2201,12 +2215,12 @@ with tab_perf:
                     avg_e = float(sub["edge"].mean())
                     return {
                         "Bucket": name,
-                        "N": N,
+                        "Picks": N,
                         "Wins": W,
                         "Losses": L,
                         "Pushes": P,
                         "Win%": round(winp, 1) if winp is not None else None,
-                        "Avg edge": round(avg_e, 2),
+                        "Avg edge (pts)": round(avg_e, 2),
                     }
 
                 buckets = [
@@ -2220,11 +2234,11 @@ with tab_perf:
                     summarize_bucket(">= 6", (dfe["abs_edge"] >= 6)),
                 ]
                 bucket_df = pd.DataFrame(buckets)
-                st.table(bucket_df)
+                st.dataframe(bucket_df, use_container_width=True)
 
-            # ---------------- BY CONFIDENCE ----------------
+            # ---------------- 3. BY CONFIDENCE ----------------
             if "confidence" in df.columns:
-                st.markdown("### By Confidence (excluding PASS)")
+                st.markdown("### 3. By Confidence (excluding PASS)")
 
                 conf_df = df[df["confidence"].isin(["MEDIUM", "STRONG"])].copy()
                 if conf_df.empty:
@@ -2245,24 +2259,24 @@ with tab_perf:
                         rows.append(
                             {
                                 "Confidence": conf_val,
-                                "N": N,
+                                "Picks": N,
                                 "Wins": W,
                                 "Losses": L,
                                 "Pushes": P,
                                 "Win%": round(winp, 1) if winp is not None else None,
-                                "Avg edge": round(avg_e, 2),
+                                "Avg edge (pts)": round(avg_e, 2),
                             }
                         )
                     if rows:
-                        st.table(pd.DataFrame(rows))
+                        st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-            # ---------------- MODELS ALIGNED ----------------
+            # ---------------- 4. MODELS ALIGNED ----------------
             if "models_aligned" in df.columns:
-                st.markdown("### Models Aligned vs Not")
+                st.markdown("### 4. Models Aligned vs Not")
 
                 aligned_rows = []
                 for label, mask in [
-                    ("Aligned", df["models_aligned"] == 1),
+                    ("Aligned (Hybrid = Cheatsheet)", df["models_aligned"] == 1),
                     ("Not aligned", df["models_aligned"] == 0),
                 ]:
                     sub = df[mask]
@@ -2270,12 +2284,12 @@ with tab_perf:
                         aligned_rows.append(
                             {
                                 "Group": label,
-                                "N": 0,
+                                "Picks": 0,
                                 "Wins": 0,
                                 "Losses": 0,
                                 "Pushes": 0,
                                 "Win%": None,
-                                "Avg edge": None,
+                                "Avg edge (pts)": None,
                             }
                         )
                         continue
@@ -2290,32 +2304,32 @@ with tab_perf:
                     aligned_rows.append(
                         {
                             "Group": label,
-                            "N": N,
+                            "Picks": N,
                             "Wins": W,
                             "Losses": L,
                             "Pushes": P,
                             "Win%": round(winp, 1) if winp is not None else None,
-                            "Avg edge": round(avg_e, 2),
+                            "Avg edge (pts)": round(avg_e, 2),
                         }
                     )
 
-                st.table(pd.DataFrame(aligned_rows))
+                st.dataframe(pd.DataFrame(aligned_rows), use_container_width=True)
 
-            # ---------------- INJURY HEAVY CONTEXT ----------------
+            # ---------------- 5. INJURY HEAVY CONTEXT ----------------
             if "injury_heavy" in df.columns:
-                st.markdown("### Injury Heavy Context")
+                st.markdown("### 5. Injury-Heavy vs Normal")
 
                 def summarize_injury(label, mask):
                     sub = df[mask]
                     if sub.empty:
                         return {
                             "Group": label,
-                            "N": 0,
+                            "Picks": 0,
                             "Wins": 0,
                             "Losses": 0,
                             "Pushes": 0,
                             "Win%": None,
-                            "Avg edge": None,
+                            "Avg edge (pts)": None,
                         }
                     N = len(sub)
                     W = (sub["spread_covered"] == 1).sum()
@@ -2326,35 +2340,35 @@ with tab_perf:
                     avg_e = float(sub["edge"].mean())
                     return {
                         "Group": label,
-                        "N": N,
+                        "Picks": N,
                         "Wins": W,
                         "Losses": L,
                         "Pushes": P,
                         "Win%": round(winp, 1) if winp is not None else None,
-                        "Avg edge": round(avg_e, 2),
+                        "Avg edge (pts)": round(avg_e, 2),
                     }
 
                 injury_rows = [
-                    summarize_injury("Injury heavy (1)", df["injury_heavy"] == 1),
+                    summarize_injury("Injury heavy = 1", df["injury_heavy"] == 1),
                     summarize_injury("Not heavy (0)", df["injury_heavy"] != 1),
                 ]
-                st.table(pd.DataFrame(injury_rows))
+                st.dataframe(pd.DataFrame(injury_rows), use_container_width=True)
 
-            # ---------------- B2B CONTEXT (if available) ----------------
+            # ---------------- 6. B2B CONTEXT (if available) ----------------
             if "fav_is_b2b" in df.columns and "dog_is_b2b" in df.columns:
-                st.markdown("### B2B Context")
+                st.markdown("### 6. B2B Context")
 
                 def summarize_b2b(label, mask):
                     sub = df[mask]
                     if sub.empty:
                         return {
                             "Group": label,
-                            "N": 0,
+                            "Picks": 0,
                             "Wins": 0,
                             "Losses": 0,
                             "Pushes": 0,
                             "Win%": None,
-                            "Avg edge": None,
+                            "Avg edge (pts)": None,
                         }
                     N = len(sub)
                     W = (sub["spread_covered"] == 1).sum()
@@ -2365,12 +2379,12 @@ with tab_perf:
                     avg_e = float(sub["edge"].mean())
                     return {
                         "Group": label,
-                        "N": N,
+                        "Picks": N,
                         "Wins": W,
                         "Losses": L,
                         "Pushes": P,
                         "Win%": round(winp, 1) if winp is not None else None,
-                        "Avg edge": round(avg_e, 2),
+                        "Avg edge (pts)": round(avg_e, 2),
                     }
 
                 b2b_rows = [
@@ -2379,7 +2393,8 @@ with tab_perf:
                     summarize_b2b("Dog B2B", df["dog_is_b2b"] == 1),
                     summarize_b2b("Dog not B2B", df["dog_is_b2b"] == 0),
                 ]
-                st.table(pd.DataFrame(b2b_rows))
+                st.dataframe(pd.DataFrame(b2b_rows), use_container_width=True)
+
 
 
 # ============================================
