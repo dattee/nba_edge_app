@@ -2853,9 +2853,12 @@ with tab_logs:
 
                 st.write("You selected:", selected_label)
 
+                confirm_key = "delete_pick_confirm"
+
                 confirm = st.checkbox(
                     "I understand this will permanently delete this pick from the log, "
-                    "Per-Game Detail, and CTG views."
+                    "Per-Game Detail, and CTG views.",
+                    key=confirm_key,
                 )
 
                 if st.button(
@@ -2869,9 +2872,11 @@ with tab_logs:
                     except Exception:
                         pass
 
+                    # Reset confirmation checkbox so it appears unchecked after rerun
+                    st.session_state[confirm_key] = False
+
                     st.success(f"Deleted pick with id {selected_id}.")
 
-                    # Rerun app so the deleted row disappears from all views
                     try:
                         st.rerun()
                     except Exception:
