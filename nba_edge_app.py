@@ -1031,8 +1031,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_single, tab_full, tab_ctg, tab_logs = st.tabs(
-    ["Single Game", "Full Slate", "CTG Review", "Prediction Log"]
+tab_single, tab_full, tab_perf, tab_ctg, tab_logs = st.tabs(
+    ["Single Game", "Full Slate", "Performance", "CTG Review", "Prediction Log"]
 )
 
 # ============================================
@@ -1893,6 +1893,234 @@ with tab_full:
             )
         else:
             st.info("No games with enough data to show in the auto-slate view.")
+
+
+# ============================================
+# PERFORMANCE OVERVIEW
+# ============================================
+with tab_perf:
+    st.subheader("Performance Overview")
+
+    # Load all logs from the DB
+    try:
+        logs_all = load_all_logs()
+    except Exception as e:
+        st.error(f"Error loading logs: {e}")
+        logs_all = pd.DataFrame()
+
+    if logs_all.empty:
+        st.info("No logged picks yet. Log some games and refresh final scores first.")
+    elif "spread_covered" not in logs_all.columns:
+        st.info("No graded results yet (spread_covered column missing).")
+    else:
+        df = logs_all.copy()
+        # Keep only rows where we have a result
+        df = df[df["spread_covered"].notna()]
+
+        if df.empty:
+            st.info(
+                "No graded picks yet. Use 'Refresh Final Scores' in Prediction Log after games complete."
+            )
+        else:
+            # ---------------- OVERALL SUMMARY ----------------
+            st.markdown("### Overall")
+
+            total = len(df)
+            wins = (df["spread_covered"] == 1).sum()
+            losses = (df["spread_covered"] == 0).sum()
+            pushes = (df["spread_covered"] == 2).sum()
+            eff = total - pushes
+
+            avg_edge = float(df["edge"].mean()) if "edge" in df.columns else float(
+                "nan"
+            )
+            win_pct = (wins / eff * 100.0) if eff > 0 else float("nan")
+
+            overall_df = pd.DataFrame(
+                [
+                    {
+                        "Total picks": total,
+                        "Eff. picks (W+L)": eff,
+                        "Wins": wins,
+                        "Losses": losses,
+                        "Pushes": pushes,
+                        "Win%": round(win_pct, 1) if eff > 0 else None,
+                        "Avg edge": round(avg_edge, 2)
+                        if not pd.isna(avg_edge)
+                        else None,
+                    }
+                ]
+            )
+            st.table(overall_df)
+
+            # ---------------- EDGE BUCKETS ----------------
+            if "edge" in df.columns:
+                st.markdown("### Performance by Edge Bucket (|edge|)")
+
+                dfe = df.copy()
+                dfe["abs_edge"] = dfe["edge"].abs()
+
+                def summarize_bucket(name, mask):
+                    sub = dfe[mask]
+                    if sub.empty:
+                        return {
+                            "Bucket": name,
+                            "N": 0,
+                            "Wins": 0,
+                            "Losses": 0,
+                            "Pushes": 0,
+                            "Win%": None,
+                            "Avg edge": None,
+                        }
+                    N = len(sub)
+                    W = (sub["spread_covered"] == 1).sum()
+                    L = (sub["spread_covered"] == 0).sum()
+                    P = (sub["spread_covered"] == 2).sum()
+                    effN = N - P
+                    winp = (W / effN * 100.0) if effN > 0 else None
+                    avg_e = float(sub["edge"].mean())
+                    return {
+                        "Bucket": name,
+                        "N": N,
+                        "Wins": W,
+                        "Losses": L,
+                        "Pushes": P,
+                        "Win%": round(winp, 1) if winp is not None else None,
+                        "Avg edge": round(avg_e, 2),
+                    }
+
+                buckets = [
+                    summarize_bucket("[0, 2)", (dfe["abs_edge"] < 2)),
+                    summarize_bucket(
+                        "[2, 4)", (dfe["abs_edge"] >= 2) & (dfe["abs_edge"] < 4)
+                    ),
+                    summarize_bucket(
+                        "[4, 6)", (dfe["abs_edge"] >= 4) & (dfe["abs_edge"] < 6)
+                    ),
+                    summarize_bucket(">= 6", (dfe["abs_edge"] >= 6)),
+                ]
+                bucket_df = pd.DataFrame(buckets)
+                st.table(bucket_df)
+
+            # ---------------- BY CONFIDENCE ----------------
+            if "confidence" in df.columns:
+                st.markdown("### By Confidence (excluding PASS)")
+
+                conf_df = df[df["confidence"].isin(["MEDIUM", "STRONG"])].copy()
+                if conf_df.empty:
+                    st.info("No MEDIUM/STRONG picks yet.")
+                else:
+                    rows = []
+                    for conf_val in ["MEDIUM", "STRONG"]:
+                        sub = conf_df[conf_df["confidence"] == conf_val]
+                        if sub.empty:
+                            continue
+                        N = len(sub)
+                        W = (sub["spread_covered"] == 1).sum()
+                        L = (sub["spread_covered"] == 0).sum()
+                        P = (sub["spread_covered"] == 2).sum()
+                        effN = N - P
+                        winp = (W / effN * 100.0) if effN > 0 else None
+                        avg_e = float(sub["edge"].mean())
+                        rows.append(
+                            {
+                                "Confidence": conf_val,
+                                "N": N,
+                                "Wins": W,
+                                "Losses": L,
+                                "Pushes": P,
+                                "Win%": round(winp, 1) if winp is not None else None,
+                                "Avg edge": round(avg_e, 2),
+                            }
+                        )
+                    if rows:
+                        st.table(pd.DataFrame(rows))
+
+            # ---------------- MODELS ALIGNED ----------------
+            if "models_aligned" in df.columns:
+                st.markdown("### Models Aligned vs Not")
+
+                aligned_rows = []
+                for label, mask in [
+                    ("Aligned", df["models_aligned"] == 1),
+                    ("Not aligned", df["models_aligned"] == 0),
+                ]:
+                    sub = df[mask]
+                    if sub.empty:
+                        aligned_rows.append(
+                            {
+                                "Group": label,
+                                "N": 0,
+                                "Wins": 0,
+                                "Losses": 0,
+                                "Pushes": 0,
+                                "Win%": None,
+                                "Avg edge": None,
+                            }
+                        )
+                        continue
+
+                    N = len(sub)
+                    W = (sub["spread_covered"] == 1).sum()
+                    L = (sub["spread_covered"] == 0).sum()
+                    P = (sub["spread_covered"] == 2).sum()
+                    effN = N - P
+                    winp = (W / effN * 100.0) if effN > 0 else None
+                    avg_e = float(sub["edge"].mean())
+                    aligned_rows.append(
+                        {
+                            "Group": label,
+                            "N": N,
+                            "Wins": W,
+                            "Losses": L,
+                            "Pushes": P,
+                            "Win%": round(winp, 1) if winp is not None else None,
+                            "Avg edge": round(avg_e, 2),
+                        }
+                    )
+
+                st.table(pd.DataFrame(aligned_rows))
+
+            # ---------------- B2B CONTEXT (if available) ----------------
+            if "fav_is_b2b" in df.columns and "dog_is_b2b" in df.columns:
+                st.markdown("### B2B Context")
+
+                def summarize_b2b(label, mask):
+                    sub = df[mask]
+                    if sub.empty:
+                        return {
+                            "Group": label,
+                            "N": 0,
+                            "Wins": 0,
+                            "Losses": 0,
+                            "Pushes": 0,
+                            "Win%": None,
+                            "Avg edge": None,
+                        }
+                    N = len(sub)
+                    W = (sub["spread_covered"] == 1).sum()
+                    L = (sub["spread_covered"] == 0).sum()
+                    P = (sub["spread_covered"] == 2).sum()
+                    effN = N - P
+                    winp = (W / effN * 100.0) if effN > 0 else None
+                    avg_e = float(sub["edge"].mean())
+                    return {
+                        "Group": label,
+                        "N": N,
+                        "Wins": W,
+                        "Losses": L,
+                        "Pushes": P,
+                        "Win%": round(winp, 1) if winp is not None else None,
+                        "Avg edge": round(avg_e, 2),
+                    }
+
+                b2b_rows = [
+                    summarize_b2b("Fav B2B", df["fav_is_b2b"] == 1),
+                    summarize_b2b("Fav not B2B", df["fav_is_b2b"] == 0),
+                    summarize_b2b("Dog B2B", df["dog_is_b2b"] == 1),
+                    summarize_b2b("Dog not B2B", df["dog_is_b2b"] == 0),
+                ]
+                st.table(pd.DataFrame(b2b_rows))
 
 
 # ============================================
