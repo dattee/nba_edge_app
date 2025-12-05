@@ -1593,6 +1593,7 @@ with tab_single:
 
     # Let user see + optionally apply BRef "OUT" lists
     apply_auto = False
+    st.write("BRef injury lists loaded:", bool(bref_team_lists))
     if bref_team_lists:
         with st.expander("Auto injuries from Basketball-Reference", expanded=False):
             col_hi, col_ai = st.columns(2)
