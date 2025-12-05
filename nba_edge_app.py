@@ -1512,12 +1512,20 @@ with tab_single:
         inj_info is something like:
             {'out': [...], 'q': [...], 'other': [...]}
         """
+        # Get heuristic starters/bench from players_df
         starters, bench = get_projected_lineup(team_abbr)
 
+        out_set = set(inj_info.get("out") or [])
+        q_set = set(inj_info.get("q") or [])
+
+        # Remove confirmed OUT players from the projected rotation
+        starters = [p for p in starters if p not in out_set]
+        bench = [p for p in bench if p not in out_set]
+
         def status_tag(name: str) -> str:
-            if name in inj_info.get("out", []):
+            if name in out_set:
                 return "OUT"
-            if name in inj_info.get("q", []):
+            if name in q_set:
                 return "Q"
             return ""
 
@@ -1530,10 +1538,8 @@ with tab_single:
         st.caption("Starters (heuristic):")
         for name in starters:
             tag = status_tag(name)
-            if tag == "OUT":
-                st.markdown(f"- {name}  · `OUT`")
-            elif tag == "Q":
-                st.markdown(f"- {name}  · `Q`")
+            if tag:
+                st.markdown(f"- {name}  · **{tag}**")
             else:
                 st.markdown(f"- {name}")
 
@@ -1541,10 +1547,8 @@ with tab_single:
             st.caption("Bench / others:")
             for name in bench:
                 tag = status_tag(name)
-                if tag == "OUT":
-                    st.markdown(f"- {name}  · `OUT`")
-                elif tag == "Q":
-                    st.markdown(f"- {name}  · `Q`")
+                if tag:
+                    st.markdown(f"- {name}  · **{tag}**")
                 else:
                     st.markdown(f"- {name}")
 

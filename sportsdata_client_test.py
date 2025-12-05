@@ -147,7 +147,7 @@ def classify_status(description: str) -> str:
         return "DOUBTFUL"
 
     # Questionable / Day-to-day bucket
-    if "questionable" in desc or "day to day" in desc:
+    if "questionable" in desc or "day to day" in desc or "probable" in desc:
         return "QUESTIONABLE"
 
     return "OTHER"
