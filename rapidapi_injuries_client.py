@@ -5,8 +5,9 @@ Client for the "NBA Injuries Reports" API on RapidAPI.
 
 Transforms the API results into:
     { 'MIA': {'out': [...], 'q': [...], 'other': [...]}, ... }
-so it can be dropped into the same structure the app already uses
-for the BRef scraper.
+
+Requires .env with:
+    RAPIDAPI_NBA_INJURIES_KEY=your_rapidapi_key_here
 """
 
 import os
@@ -28,8 +29,8 @@ HEADERS = {
     "X-RapidAPI-Host": "nba-injuries-reports.p.rapidapi.com",
 }
 
-# Map full team names from the API -> your abbreviations
-TEAM_NAME_TO_ABBR = {
+# Map full team names from the API -> app team abbreviations
+TEAM_NAME_TO_ABBR: Dict[str, str] = {
     "Atlanta Hawks": "ATL",
     "Boston Celtics": "BOS",
     "Brooklyn Nets": "BKN",
@@ -63,22 +64,33 @@ TEAM_NAME_TO_ABBR = {
 }
 
 
-def fetch_injuries_for_date(d: date):
-    """Raw call to the RapidAPI endpoint for a specific date."""
+def fetch_injuries_for_date(d: date) -> List[dict]:
+    """
+    Raw call to the RapidAPI endpoint for a specific date.
+
+    Endpoint shape:
+        GET /injuries/nba/YYYY-MM-DD
+    Returns a list of records like:
+        {'date': '2025-12-05', 'team': 'Miami Heat', 'player': 'Tyler Herro',
+         'status': 'Doubtful', 'reason': '...', 'reportTime': '07PM'}
+    """
     date_str = d.strftime("%Y-%m-%d")
     url = f"{BASE_URL}/injuries/nba/{date_str}"
     resp = requests.get(url, headers=HEADERS, timeout=20)
     resp.raise_for_status()
     data = resp.json()
-    # This API returns a bare list (no wrapper)
+    # This API currently returns a bare list
     if isinstance(data, list):
         return data
-    # Just in case it changes:
+    # Fallback in case provider wraps it later
     return data.get("data") or data.get("results") or data.get("response") or []
 
 
 def _classify_status(status: str) -> str:
-    """Map API 'status' into our three buckets: OUT, Q, OTHER."""
+    """
+    Map API 'status' into logical buckets:
+        OUT, Q (questionable/doubtful/probable), OTHER
+    """
     s = (status or "").lower()
     if "out" in s:
         return "OUT"
@@ -91,18 +103,22 @@ def _classify_status(status: str) -> str:
 
 def build_team_injury_lists_for_date(d: date) -> Dict[str, Dict[str, List[str]]]:
     """
-    Return dict:
-      { 'MIA': {'out': [...], 'q': [...], 'other': [...]}, ... }
-    for the given date.
+    Return dict for the given date:
+
+        {
+          'MIA': {'out': [...], 'q': [...], 'other': [...]},
+          'BOS': {...},
+          ...
+        }
+
+    This structure matches what the app previously used for the
+    Basketball-Reference scraper.
     """
     raw = fetch_injuries_for_date(d)
 
     team_lists: Dict[str, Dict[str, List[str]]] = {}
 
     for item in raw:
-        # Example record:
-        # {'date': '2025-12-05', 'team': 'Miami Heat', 'player': 'Tyler Herro',
-        #  'status': 'Doubtful', 'reason': '...', 'reportTime': '07PM'}
         team_full = item.get("team")
         player = item.get("player")
         status = item.get("status")
@@ -125,7 +141,7 @@ def build_team_injury_lists_for_date(d: date) -> Dict[str, Dict[str, List[str]]]
         else:
             dct["other"].append(player)
 
-    # De-dup + sort for cleanliness
+    # De-duplicate + sort
     for abbr, info in team_lists.items():
         for key in ("out", "q", "other"):
             info[key] = sorted(set(info[key]))

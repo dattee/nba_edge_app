@@ -6,64 +6,23 @@ import requests
 import datetime
 import os
 import re
+from datetime import date
 from zoneinfo import ZoneInfo
 from sqlalchemy import create_engine, text
 import pdfplumber
 from dotenv import load_dotenv
 from openai import OpenAI
-from datetime import date
 
-# RapidAPI NBA injuries client (optional)
+# ---- RapidAPI NBA injuries (primary source) ----
+HAS_RAPID_INJURIES = False
+build_team_injury_lists_for_date = None
+
 try:
     from rapidapi_injuries_client import build_team_injury_lists_for_date
     HAS_RAPID_INJURIES = True
     print("[INJ] Using RapidAPI NBA Injuries Reports client.")
 except Exception as e:
-    build_team_injury_lists_for_date = None
-    HAS_RAPID_INJURIES = False
     print("[INJ] RapidAPI injuries client not available:", e)
-from datetime import date
-
-@st.cache_data(ttl=600)
-def load_bref_injury_lists() -> dict:
-    """
-    Backwards-compatible injury loader.
-
-    - Uses RapidAPI NBA Injuries Reports when available.
-    - If that fails, returns an empty dict.
-    - Kept under the old name so the existing Single Game code still works.
-    """
-    if HAS_RAPID_INJURIES and build_team_injury_lists_for_date is not None:
-        try:
-            today = date.today()
-            data = build_team_injury_lists_for_date(today)
-            print(f"[INJ] Loaded RapidAPI injuries for {len(data)} teams")
-            return data
-        except Exception as e:
-            print("[INJ] RapidAPI injuries failed:", e)
-
-    # Fallback: nothing
-    print("[INJ] No injury data available.")
-    return {}
-
-
-# ---- Basketball-Reference injury scraper import ----
-HAS_BREF_INJURIES = False
-get_team_injury_lists = None
-
-# Try a couple of possible module names, in case you renamed the file
-for mod_name in ("injury_scraper_bref", "sportsdata_client_test"):
-    try:
-        bref_mod = __import__(mod_name, fromlist=["get_team_injury_lists"])
-        get_team_injury_lists = getattr(bref_mod, "get_team_injury_lists")
-        HAS_BREF_INJURIES = True
-        print(f"[BREF] Using injury scraper from {mod_name}.py")
-        break
-    except Exception as e:
-        print(f"[BREF] Failed to import from {mod_name}: {e}")
-
-if not HAS_BREF_INJURIES:
-    print("[BREF] No injury scraper available – auto injuries disabled.")
 
 # Load environment variables from .env
 load_dotenv()
@@ -332,61 +291,26 @@ if TEAM_RATINGS_AVAILABLE:
             break
 else:
     LEAGUE_AVG_PACE = None
-    
-
-@st.cache_data(ttl=600)
-def load_bref_injury_lists() -> dict:
-    """
-    Backwards-compatible injury loader.
-
-    - Uses RapidAPI NBA Injuries Reports when available.
-    - If that fails, returns an empty dict.
-    - Kept under the old name so the existing Single Game code still works.
-    """
-    if HAS_RAPID_INJURIES and build_team_injury_lists_for_date is not None:
-        try:
-            today = date.today()
-            data = build_team_injury_lists_for_date(today)
-            print(f"[INJ] Loaded RapidAPI injuries for {len(data)} teams")
-            return data
-        except Exception as e:
-            print("[INJ] RapidAPI injuries failed:", e)
-
-    # Fallback: nothing
-    print("[INJ] No injury data available.")
-    return {}
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300)
 def load_injury_lists_for_today() -> dict:
     """
-    High-level injury loader for the app.
+    Fetch today's NBA injuries from RapidAPI and cache for a few minutes.
 
-    - First tries RapidAPI NBA Injuries Reports (if available).
-    - If that fails or returns empty, falls back to BRef scraper.
-    - Returns dict: { 'MIA': {'out': [...], 'q': [...], 'other': [...]}, ... }.
+    Returns:
+      { 'MIA': {'out': [...], 'q': [...], 'other': [...]}, ... }
     """
-    today = date.today()
+    if not HAS_RAPID_INJURIES or build_team_injury_lists_for_date is None:
+        print("[INJ] RapidAPI client not available; no injury data.")
+        return {}
 
-    # 1) Try RapidAPI, if configured
-    if HAS_RAPID_INJURIES and build_team_injury_lists_for_date is not None:
-        try:
-            rapid_data = build_team_injury_lists_for_date(today)
-            if rapid_data:
-                print(f"[INJ] Loaded RapidAPI injuries for {len(rapid_data)} teams")
-                return rapid_data
-            else:
-                print("[INJ] RapidAPI injuries returned empty; falling back to BRef.")
-        except Exception as e:
-            print("[INJ] RapidAPI injuries failed:", e)
-
-    # 2) Fall back to BRef if you still have that wired
     try:
-        from sportsdata_client_test import get_team_injury_lists
-        print("[INJ] Falling back to BRef injuries scraper.")
-        return get_team_injury_lists()
+        data = build_team_injury_lists_for_date(date.today())
+        print(f"[INJ] Loaded RapidAPI injuries for {len(data)} teams")
+        return data
     except Exception as e:
-        print("[INJ] BRef scraper also failed:", e)
+        print("[INJ] Error while fetching RapidAPI injuries:", e)
         return {}
 
 
@@ -1650,6 +1574,20 @@ with tab_single:
             step=1,
         )
 
+    # ---- Injuries from RapidAPI + refresh button ----
+    refresh_col, _ = st.columns([1, 3])
+    with refresh_col:
+        if st.button("Refresh injuries", key="refresh_injuries"):
+            # Clear cache so the next call pulls fresh data
+            load_injury_lists_for_today.clear()
+            st.success("Injuries reloaded from RapidAPI.")
+
+    injury_lists = load_injury_lists_for_today()
+    st.caption(f"Injury lists loaded: {bool(injury_lists)}")
+
+    home_inj = injury_lists.get(home_abbr, {"out": [], "q": [], "other": []})
+    away_inj = injury_lists.get(away_abbr, {"out": [], "q": [], "other": []})
+
     def get_player_pool(team_abbr: str):
         team_df = players_df[players_df["Team"] == team_abbr]
         long_out_names = []
@@ -1670,16 +1608,10 @@ with tab_single:
     home_players, home_long_out = get_player_pool(home_abbr)
     away_players, away_long_out = get_player_pool(away_abbr)
 
-    # Optional: auto injuries from Basketball-Reference
-    bref_team_lists = load_bref_injury_lists()
-    home_inj = bref_team_lists.get(home_abbr, {"out": [], "q": [], "other": []})
-    away_inj = bref_team_lists.get(away_abbr, {"out": [], "q": [], "other": []})
-
-    # Let user see + optionally apply BRef "OUT" lists
+    # Let user see + optionally apply auto "OUT" lists from RapidAPI
     apply_auto = False
-    st.write("BRef injury lists loaded:", bool(bref_team_lists))
-    if bref_team_lists:
-        with st.expander("Auto injuries from Basketball-Reference", expanded=False):
+    if injury_lists:
+        with st.expander("Auto injuries from RapidAPI", expanded=False):
             col_hi, col_ai = st.columns(2)
 
             with col_hi:
@@ -1702,7 +1634,7 @@ with tab_single:
 
             apply_auto = st.button(
                 "Apply 'Out' lists above to selectors for this game",
-                key="apply_bref_auto_out",
+                key="apply_inj_auto_out",
             )
 
     # --- Projected lineup v1 (read-only helper) ---
