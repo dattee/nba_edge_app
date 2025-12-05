@@ -12,6 +12,14 @@ import pdfplumber
 from dotenv import load_dotenv
 from openai import OpenAI
 
+# Optional: Basketball-Reference injury scraper
+try:
+    from sportsdata_client_test import get_team_injury_lists
+    HAS_BREF_INJURIES = True
+except Exception:
+    get_team_injury_lists = None
+    HAS_BREF_INJURIES = False
+
 # Load environment variables from .env
 load_dotenv()
 
@@ -279,6 +287,23 @@ if TEAM_RATINGS_AVAILABLE:
             break
 else:
     LEAGUE_AVG_PACE = None
+
+
+@st.cache_data(ttl=600)
+def load_bref_injury_lists() -> dict:
+    """
+    Cached wrapper around the Basketball-Reference injury scraper.
+
+    Returns:
+      dict like {'GSW': {'out': [...], 'q': [...], 'other': [...]}, ...}
+    """
+    if not HAS_BREF_INJURIES or get_team_injury_lists is None:
+        return {}
+    try:
+        return get_team_injury_lists()
+    except Exception:
+        # Fail quietly; app will just not show auto injuries
+        return {}
 
 
 def get_team_power(team_abbr: str, is_home: bool) -> float | None:
@@ -1440,9 +1465,65 @@ with tab_single:
 
         return team_df["Player"].dropna().unique().tolist(), long_out_names
 
+    # Base player pools from your on/off data
     home_players, home_long_out = get_player_pool(home_abbr)
     away_players, away_long_out = get_player_pool(away_abbr)
 
+    # Optional: auto injuries from Basketball-Reference
+    bref_team_lists = load_bref_injury_lists()
+    home_inj = bref_team_lists.get(home_abbr, {"out": [], "q": [], "other": []})
+    away_inj = bref_team_lists.get(away_abbr, {"out": [], "q": [], "other": []})
+
+    # Let user see + optionally apply BRef "OUT" lists
+    apply_auto = False
+    if bref_team_lists:
+        with st.expander("Auto injuries from Basketball-Reference", expanded=False):
+            col_hi, col_ai = st.columns(2)
+
+            with col_hi:
+                st.markdown(f"**{home_abbr}**")
+                if home_inj["out"]:
+                    st.caption("Out:")
+                    st.write(", ".join(home_inj["out"]))
+                if home_inj["q"]:
+                    st.caption("Questionable / Doubtful:")
+                    st.write(", ".join(home_inj["q"]))
+
+            with col_ai:
+                st.markdown(f"**{away_abbr}**")
+                if away_inj["out"]:
+                    st.caption("Out:")
+                    st.write(", ".join(away_inj["out"]))
+                if away_inj["q"]:
+                    st.caption("Questionable / Doubtful:")
+                    st.write(", ".join(away_inj["q"]))
+
+            apply_auto = st.button(
+                "Apply 'Out' lists above to selectors for this game",
+                key="apply_bref_auto_out",
+            )
+
+    # When user clicks apply_auto, pre-fill the selectboxes via session_state
+    if apply_auto:
+        # Home side
+        for i in range(5):
+            default_name = "None"
+            if i < len(home_inj["out"]):
+                candidate = home_inj["out"][i]
+                if candidate in home_players:
+                    default_name = candidate
+            st.session_state[f"home_out_{i}"] = default_name
+
+        # Away side
+        for i in range(5):
+            default_name = "None"
+            if i < len(away_inj["out"]):
+                candidate = away_inj["out"][i]
+                if candidate in away_players:
+                    default_name = candidate
+            st.session_state[f"away_out_{i}"] = default_name
+
+    # Manual / final selection of out players (drives the model)
     home_out, away_out = [], []
     colH, colA2 = st.columns(2)
 
