@@ -1435,6 +1435,95 @@ with tab_single:
         key="proj_dog_input",
     )
 
+    def get_projected_lineup(team_abbr: str, max_players: int = 12, max_days: int = 30):
+        """
+        Heuristic projected lineup for a team.
+
+        - Filters to players on this team in players_df.
+        - Keeps only reasonably recent players (DaysSinceLastGame <= max_days or NaN).
+        - Sorts by:
+            1) Most recent game (DaysSinceLastGame ascending)
+            2) Impact (abs(Diff) descending) if Diff exists.
+        - Returns:
+            starters: first 5 players
+            bench: next players up to max_players total
+        """
+        team_df = players_df[players_df["Team"] == team_abbr].copy()
+
+        # Filter to somewhat recent players
+        if "DaysSinceLastGame" in team_df.columns:
+            recent_mask = (
+                team_df["DaysSinceLastGame"].isna()
+                | (team_df["DaysSinceLastGame"] <= max_days)
+            )
+            team_df = team_df[recent_mask]
+
+        # Sorting heuristics
+        sort_cols = []
+        ascending = []
+
+        if "DaysSinceLastGame" in team_df.columns:
+            sort_cols.append("DaysSinceLastGame")
+            ascending.append(True)
+
+        if "Diff" in team_df.columns:
+            team_df["abs_diff_for_sort"] = team_df["Diff"].abs()
+            sort_cols.append("abs_diff_for_sort")
+            ascending.append(False)
+
+        if sort_cols:
+            team_df = team_df.sort_values(sort_cols, ascending=ascending)
+
+        players = team_df["Player"].dropna().tolist()
+
+        starters = players[:5]
+        bench = players[5:max_players]
+
+        return starters, bench
+
+    def render_projected_lineup(team_abbr: str, inj_info: dict, label: str):
+        """
+        Show a simple projected lineup card for one team.
+
+        inj_info is something like:
+            {'out': [...], 'q': [...], 'other': [...]}
+        """
+        starters, bench = get_projected_lineup(team_abbr)
+
+        def status_tag(name: str) -> str:
+            if name in inj_info.get("out", []):
+                return "OUT"
+            if name in inj_info.get("q", []):
+                return "Q"
+            return ""
+
+        st.markdown(f"**{label} {team_abbr} – Projected lineup (v1)**")
+
+        if not starters and not bench:
+            st.caption("No recent players found for this team.")
+            return
+
+        st.caption("Starters (heuristic):")
+        for name in starters:
+            tag = status_tag(name)
+            if tag == "OUT":
+                st.markdown(f"- {name}  · `OUT`")
+            elif tag == "Q":
+                st.markdown(f"- {name}  · `Q`")
+            else:
+                st.markdown(f"- {name}")
+
+        if bench:
+            st.caption("Bench / others:")
+            for name in bench:
+                tag = status_tag(name)
+                if tag == "OUT":
+                    st.markdown(f"- {name}  · `OUT`")
+                elif tag == "Q":
+                    st.markdown(f"- {name}  · `Q`")
+                else:
+                    st.markdown(f"- {name}")
+
     st.subheader("Player Availability (On/Off Impact)")
 
     col_filter1, col_filter2 = st.columns(2)
@@ -1502,6 +1591,16 @@ with tab_single:
                 "Apply 'Out' lists above to selectors for this game",
                 key="apply_bref_auto_out",
             )
+
+    # --- Projected lineup v1 (read-only helper) ---
+    with st.expander("Projected lineups (v1)", expanded=False):
+        col_pl_home, col_pl_away = st.columns(2)
+
+        with col_pl_home:
+            render_projected_lineup(home_abbr, home_inj, label="Home")
+
+        with col_pl_away:
+            render_projected_lineup(away_abbr, away_inj, label="Away")
 
     # When user clicks apply_auto, pre-fill the selectboxes via session_state
     if apply_auto:
