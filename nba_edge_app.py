@@ -1441,9 +1441,12 @@ with tab_single:
 
         - Filters to players on this team in players_df.
         - Keeps only reasonably recent players (DaysSinceLastGame <= max_days or NaN).
+        - Tries to identify rotation players using a minutes column if available.
         - Sorts by:
-            1) Most recent game (DaysSinceLastGame ascending)
-            2) Impact (abs(Diff) descending) if Diff exists.
+            1) Rotation flag (True first)
+            2) Minutes (descending) if available
+            3) Most recent game (DaysSinceLastGame ascending)
+            4) Impact (abs(Diff) descending) if Diff exists.
         - Returns:
             starters: first 5 players
             bench: next players up to max_players total
@@ -1458,24 +1461,45 @@ with tab_single:
             )
             team_df = team_df[recent_mask]
 
-        # Sorting heuristics
-        sort_cols = []
-        ascending = []
+        if team_df.empty:
+            return [], []
+
+        # Try to find a minutes column
+        minutes_col = None
+        for col in ["MP", "Minutes", "MIN", "MinPerGame", "MinutesPerGame"]:
+            if col in team_df.columns:
+                minutes_col = col
+                break
+
+        # Rotation flag: guys who play real minutes
+        if minutes_col:
+            team_df["rotation_flag"] = team_df[minutes_col].fillna(0) >= 10  # 10+ mins
+        else:
+            team_df["rotation_flag"] = True
+
+        # Impact magnitude for tie-breaking
+        if "Diff" in team_df.columns:
+            team_df["abs_diff_for_sort"] = team_df["Diff"].abs()
+        else:
+            team_df["abs_diff_for_sort"] = 0.0
+
+        sort_cols = ["rotation_flag"]
+        ascending = [False]  # rotation players first
+
+        if minutes_col:
+            sort_cols.append(minutes_col)
+            ascending.append(False)  # more minutes first
 
         if "DaysSinceLastGame" in team_df.columns:
             sort_cols.append("DaysSinceLastGame")
-            ascending.append(True)
+            ascending.append(True)  # more recent first
 
-        if "Diff" in team_df.columns:
-            team_df["abs_diff_for_sort"] = team_df["Diff"].abs()
-            sort_cols.append("abs_diff_for_sort")
-            ascending.append(False)
+        sort_cols.append("abs_diff_for_sort")
+        ascending.append(False)  # bigger impact first
 
-        if sort_cols:
-            team_df = team_df.sort_values(sort_cols, ascending=ascending)
+        team_df = team_df.sort_values(sort_cols, ascending=ascending)
 
         players = team_df["Player"].dropna().tolist()
-
         starters = players[:5]
         bench = players[5:max_players]
 
