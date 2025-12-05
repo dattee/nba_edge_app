@@ -1505,22 +1505,20 @@ with tab_single:
 
     # When user clicks apply_auto, pre-fill the selectboxes via session_state
     if apply_auto:
-        # Home side
-        for i in range(5):
-            default_name = "None"
-            if i < len(home_inj["out"]):
-                candidate = home_inj["out"][i]
-                if candidate in home_players:
-                    default_name = candidate
+        max_slots = 5
+
+        # Home: keep only OUT players that are actually in the current pool
+        home_candidates = [p for p in home_inj["out"] if p in home_players]
+
+        for i in range(max_slots):
+            default_name = home_candidates[i] if i < len(home_candidates) else "None"
             st.session_state[f"home_out_{i}"] = default_name
 
-        # Away side
-        for i in range(5):
-            default_name = "None"
-            if i < len(away_inj["out"]):
-                candidate = away_inj["out"][i]
-                if candidate in away_players:
-                    default_name = candidate
+        # Away: same logic
+        away_candidates = [p for p in away_inj["out"] if p in away_players]
+
+        for i in range(max_slots):
+            default_name = away_candidates[i] if i < len(away_candidates) else "None"
             st.session_state[f"away_out_{i}"] = default_name
 
     # Manual / final selection of out players (drives the model)
