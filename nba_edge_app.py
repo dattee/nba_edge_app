@@ -293,24 +293,26 @@ else:
     LEAGUE_AVG_PACE = None
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=300)  # cache for 5 minutes
 def load_injury_lists_for_today() -> dict:
     """
-    Fetch today's NBA injuries from RapidAPI and cache for a few minutes.
+    Load injury lists for today from RapidAPI.
 
     Returns:
-      { 'MIA': {'out': [...], 'q': [...], 'other': [...]}, ... }
+        { 'MIA': {'out': [...], 'q': [...], 'other': [...]}, ... }
     """
     if not HAS_RAPID_INJURIES or build_team_injury_lists_for_date is None:
-        print("[INJ] RapidAPI client not available; no injury data.")
+        print("[INJ] RapidAPI client not available.")
         return {}
 
+    today = date.today()
+
     try:
-        data = build_team_injury_lists_for_date(date.today())
+        data = build_team_injury_lists_for_date(today)
         print(f"[INJ] Loaded RapidAPI injuries for {len(data)} teams")
         return data
     except Exception as e:
-        print("[INJ] Error while fetching RapidAPI injuries:", e)
+        print("[INJ] RapidAPI injuries failed:", e)
         return {}
 
 
@@ -1574,16 +1576,18 @@ with tab_single:
             step=1,
         )
 
-    # ---- Injuries from RapidAPI + refresh button ----
+    # --- Injury lists from RapidAPI ---
+
     refresh_col, _ = st.columns([1, 3])
     with refresh_col:
         if st.button("Refresh injuries", key="refresh_injuries"):
-            # Clear cache so the next call pulls fresh data
+            # Clear the cached injury data so the next call pulls fresh
             load_injury_lists_for_today.clear()
-            st.success("Injuries reloaded from RapidAPI.")
+            st.success("Injuries reloaded from API.")
 
     injury_lists = load_injury_lists_for_today()
-    st.caption(f"Injury lists loaded: {bool(injury_lists)}")
+    injury_loaded = bool(injury_lists)
+    st.caption(f"Injury list loaded: {injury_loaded}")
 
     home_inj = injury_lists.get(home_abbr, {"out": [], "q": [], "other": []})
     away_inj = injury_lists.get(away_abbr, {"out": [], "q": [], "other": []})
@@ -1608,34 +1612,57 @@ with tab_single:
     home_players, home_long_out = get_player_pool(home_abbr)
     away_players, away_long_out = get_player_pool(away_abbr)
 
-    # Let user see + optionally apply auto "OUT" lists from RapidAPI
+    # --- Auto injuries expander (RapidAPI) ---
+
+    def format_injury_block(label: str, info: dict):
+        outs = info.get("out", []) or []
+        qs = info.get("q", []) or []
+        other = info.get("other", []) or []
+
+        st.markdown(f"**{label}**")
+        st.markdown("**Out:** " + (", ".join(outs) if outs else "_None_"))
+        st.markdown(
+            "**Questionable / Doubtful / Probable:** "
+            + (", ".join(qs) if qs else "_None_")
+        )
+        if other:
+            st.markdown("**Other statuses:** " + ", ".join(other))
+        st.markdown("---")
+
     apply_auto = False
-    if injury_lists:
-        with st.expander("Auto injuries from RapidAPI", expanded=False):
-            col_hi, col_ai = st.columns(2)
-
-            with col_hi:
-                st.markdown(f"**{home_abbr}**")
-                if home_inj["out"]:
-                    st.caption("Out:")
-                    st.write(", ".join(home_inj["out"]))
-                if home_inj["q"]:
-                    st.caption("Questionable / Doubtful:")
-                    st.write(", ".join(home_inj["q"]))
-
-            with col_ai:
-                st.markdown(f"**{away_abbr}**")
-                if away_inj["out"]:
-                    st.caption("Out:")
-                    st.write(", ".join(away_inj["out"]))
-                if away_inj["q"]:
-                    st.caption("Questionable / Doubtful:")
-                    st.write(", ".join(away_inj["q"]))
+    if injury_loaded:
+        with st.expander(
+            "Auto injuries from NBA Injury Reports (RapidAPI)", expanded=False
+        ):
+            format_injury_block(home_abbr, home_inj)
+            format_injury_block(away_abbr, away_inj)
 
             apply_auto = st.button(
                 "Apply 'Out' lists above to selectors for this game",
-                key="apply_inj_auto_out",
+                key="apply_rapid_out_lists",
             )
+
+    # If user clicked "Apply" we want to pre-fill the out-selectors
+    if apply_auto and injury_loaded:
+        # Only use players who are actually in the current player pool
+        home_out_names = [p for p in home_inj.get("out", []) if p in home_players]
+        away_out_names = [p for p in away_inj.get("out", []) if p in away_players]
+
+        # Fill home_out_0..4 in order, skipping blanks
+        for i in range(5):
+            key = f"home_out_{i}"
+            if i < len(home_out_names):
+                st.session_state[key] = home_out_names[i]
+            else:
+                st.session_state[key] = "None"
+
+        # Fill away_out_0..4 in order
+        for i in range(5):
+            key = f"away_out_{i}"
+            if i < len(away_out_names):
+                st.session_state[key] = away_out_names[i]
+            else:
+                st.session_state[key] = "None"
 
     # --- Projected lineup v1 (read-only helper) ---
     with st.expander("Projected lineups (v1)", expanded=False):
@@ -1646,24 +1673,6 @@ with tab_single:
 
         with col_pl_away:
             render_projected_lineup(away_abbr, away_inj, label="Away")
-
-    # When user clicks apply_auto, pre-fill the selectboxes via session_state
-    if apply_auto:
-        max_slots = 5
-
-        # Home: keep only OUT players that are actually in the current pool
-        home_candidates = [p for p in home_inj["out"] if p in home_players]
-
-        for i in range(max_slots):
-            default_name = home_candidates[i] if i < len(home_candidates) else "None"
-            st.session_state[f"home_out_{i}"] = default_name
-
-        # Away: same logic
-        away_candidates = [p for p in away_inj["out"] if p in away_players]
-
-        for i in range(max_slots):
-            default_name = away_candidates[i] if i < len(away_candidates) else "None"
-            st.session_state[f"away_out_{i}"] = default_name
 
     # Manual / final selection of out players (drives the model)
     home_out, away_out = [], []
