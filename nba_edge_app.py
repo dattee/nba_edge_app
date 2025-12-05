@@ -12,13 +12,23 @@ import pdfplumber
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Optional: Basketball-Reference injury scraper
-try:
-    from sportsdata_client_test import get_team_injury_lists
-    HAS_BREF_INJURIES = True
-except Exception:
-    get_team_injury_lists = None
-    HAS_BREF_INJURIES = False
+# ---- Basketball-Reference injury scraper import ----
+HAS_BREF_INJURIES = False
+get_team_injury_lists = None
+
+# Try a couple of possible module names, in case you renamed the file
+for mod_name in ("injury_scraper_bref", "sportsdata_client_test"):
+    try:
+        bref_mod = __import__(mod_name, fromlist=["get_team_injury_lists"])
+        get_team_injury_lists = getattr(bref_mod, "get_team_injury_lists")
+        HAS_BREF_INJURIES = True
+        print(f"[BREF] Using injury scraper from {mod_name}.py")
+        break
+    except Exception as e:
+        print(f"[BREF] Failed to import from {mod_name}: {e}")
+
+if not HAS_BREF_INJURIES:
+    print("[BREF] No injury scraper available – auto injuries disabled.")
 
 # Load environment variables from .env
 load_dotenv()
@@ -298,11 +308,15 @@ def load_bref_injury_lists() -> dict:
       dict like {'GSW': {'out': [...], 'q': [...], 'other': [...]}, ...}
     """
     if not HAS_BREF_INJURIES or get_team_injury_lists is None:
+        print("[BREF] load_bref_injury_lists: scraper not available")
         return {}
+
     try:
-        return get_team_injury_lists()
-    except Exception:
-        # Fail quietly; app will just not show auto injuries
+        data = get_team_injury_lists()
+        print(f"[BREF] Loaded injury lists for {len(data)} teams")
+        return data
+    except Exception as e:
+        print("[BREF] Error while fetching injuries:", e)
         return {}
 
 
