@@ -30,7 +30,7 @@ PLAYERS_ONOFF_CSV = "players_onoff.csv"
 # If a player hasn't played since more than this many days ago,
 # you can treat them as "long-term out" in the app and hide them from
 # the Out dropdown.
-LONG_TERM_OUT_DAYS = 21
+LONG_TERM_OUT_DAYS = 14
 
 
 @dataclass
