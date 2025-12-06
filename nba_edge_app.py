@@ -219,6 +219,14 @@ with engine.connect() as conn:
         "dog_injury_impact_flag": "TEXT",
         "fav_injury_heavy": "INTEGER",
         "dog_injury_heavy": "INTEGER",
+        # CTG-based magnitude + sample flags
+        "injury_sum_abs_diff": "REAL",
+        "injury_sum_abs_diff_weighted": "REAL",
+        "fav_sum_abs_diff": "REAL",
+        "dog_sum_abs_diff": "REAL",
+        "inj_small_sample": "INTEGER",
+        "fav_small_sample": "INTEGER",
+        "dog_small_sample": "INTEGER",
     }
     for ic, col_type in injury_cols.items():
         if ic not in col_names:
@@ -441,6 +449,74 @@ def compute_player_injury_terms(out_players, players_df, injury_cap=6.0):
     # So we only return the raw here; the caller will pass the effective value
     # back into another helper that applies the cap & flags.
     return player_adj_raw, 0.0, "low", 0
+
+
+def summarize_injury_magnitude(
+    out_players,
+    players_df: pd.DataFrame,
+    small_sample_min_minutes: float = 300.0,
+):
+    """
+    Summarize injury magnitude for logging/analysis using CTG Diff + MIN.
+
+    Parameters
+    ----------
+    out_players : list[str]
+        Player names selected as OUT.
+    players_df : pd.DataFrame
+        Must have at least ["Player", "Diff"]. If "MIN" exists,
+        it will be used for a small-sample flag and weighting.
+
+    Returns
+    -------
+    sum_abs_diff : float
+        Sum of |Diff| for all OUT players.
+    sum_abs_diff_weighted : float
+        Sum of |Diff| weighted by MIN / 1000 (capped at 1.0) when MIN is present.
+    small_sample_flag : int
+        1 if any OUT player has MIN < small_sample_min_minutes, else 0.
+    """
+    if not out_players or players_df is None or players_df.empty:
+        return 0.0, 0.0, 0
+
+    cols = players_df.columns
+    has_min = "MIN" in cols
+
+    sum_abs = 0.0
+    sum_abs_weighted = 0.0
+    small_flag = 0
+
+    for name in out_players:
+        row = players_df.loc[players_df["Player"] == name]
+        if row.empty:
+            continue
+
+        diff = row["Diff"].iloc[0]
+        try:
+            diff = float(diff)
+        except (TypeError, ValueError):
+            diff = 0.0
+
+        abs_diff = abs(diff)
+        sum_abs += abs_diff
+
+        weight = 1.0
+        if has_min:
+            min_val = row["MIN"].iloc[0]
+            try:
+                min_val = float(min_val)
+            except (TypeError, ValueError):
+                min_val = None
+
+            if min_val is not None and not math.isnan(min_val):
+                if min_val < small_sample_min_minutes:
+                    small_flag = 1
+                # Weight bigger-minute players more, capped at 1.0
+                weight = min(1.0, max(0.0, min_val / 1000.0))
+
+        sum_abs_weighted += abs_diff * weight
+
+    return sum_abs, sum_abs_weighted, small_flag
 
 
 def cap_and_flag_injury_effect(effective_player_adj, injury_cap=6.0):
@@ -1732,6 +1808,24 @@ with tab_single:
         fav_out_players = home_out if fav_is_home else away_out
         dog_out_players = away_out if fav_is_home else home_out
 
+        # Magnitude + sample quality from CTG Diff/MIN
+        (
+            fav_sum_abs_diff,
+            fav_sum_abs_diff_w,
+            fav_small_sample,
+        ) = summarize_injury_magnitude(fav_out_players, players_df)
+
+        (
+            dog_sum_abs_diff,
+            dog_sum_abs_diff_w,
+            dog_small_sample,
+        ) = summarize_injury_magnitude(dog_out_players, players_df)
+
+        injury_sum_abs_diff = (fav_sum_abs_diff or 0.0) + (dog_sum_abs_diff or 0.0)
+        injury_sum_abs_diff_weighted = (fav_sum_abs_diff_w or 0.0) + (dog_sum_abs_diff_w or 0.0)
+        inj_small_sample = 1 if (fav_small_sample or dog_small_sample) else 0
+
+        # Raw injury adjustments (recency-weighted Diff, existing logic)
         fav_player_adj_raw, _, _, _ = compute_player_injury_terms(
             out_players=fav_out_players, players_df=players_df
         )
@@ -2215,6 +2309,14 @@ with tab_single:
                         "dog_injury_impact_flag": dog_injury_impact_flag,
                         "fav_injury_heavy": fav_injury_heavy,
                         "dog_injury_heavy": dog_injury_heavy,
+                        # NEW: CTG-based magnitude + sample flags
+                        "injury_sum_abs_diff": injury_sum_abs_diff,
+                        "injury_sum_abs_diff_weighted": injury_sum_abs_diff_weighted,
+                        "fav_sum_abs_diff": fav_sum_abs_diff,
+                        "dog_sum_abs_diff": dog_sum_abs_diff,
+                        "inj_small_sample": inj_small_sample,
+                        "fav_small_sample": fav_small_sample,
+                        "dog_small_sample": dog_small_sample,
                         # components for weight learning
                         "stat_margin": st.session_state.get("stat_margin"),
                         "team_margin": st.session_state.get("fav_team_margin_combined"),
