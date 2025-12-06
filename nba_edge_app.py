@@ -1775,20 +1775,41 @@ with tab_single:
                 st.caption(
                     "Based on highest-possession 5-man lineup that does not include OUT players."
                 )
-                # Build a small DF using CTG starters, and look up MIN/Diff from players_df
-                home_starters_df = (
-                    players_df[
-                        (players_df["Team"] == home_abbr)
-                        & (players_df["Player"].isin(home_ctg_starters))
-                    ]
-                    .copy()
-                )
-                if "MIN" not in home_starters_df.columns:
-                    home_starters_df["MIN"] = 0.0
-                if "Diff" not in home_starters_df.columns:
-                    home_starters_df["Diff"] = 0.0
+                inj_info = injury_lists.get(home_abbr, {"out": [], "q": [], "other": []})
+                out_set = set(inj_info.get("out", []))
+                q_set = set(inj_info.get("q", []))
 
-                home_starters_df = home_starters_df[["Player", "MIN", "Diff"]].sort_values(
+                def player_status(name: str) -> str:
+                    if name in out_set:
+                        return "OUT"
+                    if name in q_set:
+                        return "Q"
+                    return "OK"
+
+                players_list = home_ctg_starters
+                base = players_df[
+                    (players_df["Team"] == home_abbr)
+                    & (players_df["Player"].isin(players_list))
+                ].copy()
+                if "MIN" not in base.columns:
+                    base["MIN"] = 0.0
+                if "Diff" not in base.columns:
+                    base["Diff"] = 0.0
+
+                missing = [p for p in players_list if p not in base["Player"].tolist()]
+                if missing:
+                    extra_rows = pd.DataFrame(
+                        {
+                            "Player": missing,
+                            "Team": home_abbr,
+                            "MIN": 0.0,
+                            "Diff": 0.0,
+                        }
+                    )
+                    base = pd.concat([base, extra_rows], ignore_index=True)
+
+                base["Status"] = base["Player"].apply(player_status)
+                home_starters_df = base[["Player", "Status", "MIN", "Diff"]].sort_values(
                     "MIN", ascending=False
                 )
                 st.dataframe(
@@ -1806,7 +1827,8 @@ with tab_single:
                     home_bench_df["MIN"] = 0.0
                 if "Diff" not in home_bench_df.columns:
                     home_bench_df["Diff"] = 0.0
-                home_bench_df = home_bench_df[["Player", "MIN", "Diff"]].sort_values(
+                home_bench_df["Status"] = home_bench_df["Player"].apply(player_status)
+                home_bench_df = home_bench_df[["Player", "Status", "MIN", "Diff"]].sort_values(
                     "MIN", ascending=False
                 )
                 st.markdown(f"**{home_abbr} bench (by MIN)**")
@@ -1838,19 +1860,41 @@ with tab_single:
                 st.caption(
                     "Based on highest-possession 5-man lineup that does not include OUT players."
                 )
-                away_starters_df = (
-                    players_df[
-                        (players_df["Team"] == away_abbr)
-                        & (players_df["Player"].isin(away_ctg_starters))
-                    ]
-                    .copy()
-                )
-                if "MIN" not in away_starters_df.columns:
-                    away_starters_df["MIN"] = 0.0
-                if "Diff" not in away_starters_df.columns:
-                    away_starters_df["Diff"] = 0.0
+                inj_info = injury_lists.get(away_abbr, {"out": [], "q": [], "other": []})
+                out_set = set(inj_info.get("out", []))
+                q_set = set(inj_info.get("q", []))
 
-                away_starters_df = away_starters_df[["Player", "MIN", "Diff"]].sort_values(
+                def player_status(name: str) -> str:
+                    if name in out_set:
+                        return "OUT"
+                    if name in q_set:
+                        return "Q"
+                    return "OK"
+
+                players_list = away_ctg_starters
+                base = players_df[
+                    (players_df["Team"] == away_abbr)
+                    & (players_df["Player"].isin(players_list))
+                ].copy()
+                if "MIN" not in base.columns:
+                    base["MIN"] = 0.0
+                if "Diff" not in base.columns:
+                    base["Diff"] = 0.0
+
+                missing = [p for p in players_list if p not in base["Player"].tolist()]
+                if missing:
+                    extra_rows = pd.DataFrame(
+                        {
+                            "Player": missing,
+                            "Team": away_abbr,
+                            "MIN": 0.0,
+                            "Diff": 0.0,
+                        }
+                    )
+                    base = pd.concat([base, extra_rows], ignore_index=True)
+
+                base["Status"] = base["Player"].apply(player_status)
+                away_starters_df = base[["Player", "Status", "MIN", "Diff"]].sort_values(
                     "MIN", ascending=False
                 )
                 st.dataframe(
@@ -1867,7 +1911,8 @@ with tab_single:
                     away_bench_df["MIN"] = 0.0
                 if "Diff" not in away_bench_df.columns:
                     away_bench_df["Diff"] = 0.0
-                away_bench_df = away_bench_df[["Player", "MIN", "Diff"]].sort_values(
+                away_bench_df["Status"] = away_bench_df["Player"].apply(player_status)
+                away_bench_df = away_bench_df[["Player", "Status", "MIN", "Diff"]].sort_values(
                     "MIN", ascending=False
                 )
                 st.markdown(f"**{away_abbr} bench (by MIN)**")
