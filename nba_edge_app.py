@@ -1885,9 +1885,6 @@ with tab_single:
 
             if home_ctg_starters:
                 st.markdown(f"**{home_abbr} projected starters (CTG lineups)**")
-                st.caption(
-                    "Based on highest-possession 5-man lineup that does not include OUT players."
-                )
                 home_starters_df = prepare_lineup_df(
                     home_abbr, home_ctg_starters, home_long_out if hide_long_out else None
                 )
@@ -1907,6 +1904,17 @@ with tab_single:
                     use_container_width=True,
                     hide_index=True,
                 )
+
+                home_status_map = team_status.get(home_abbr, {})
+
+                home_out_names = [
+                    p
+                    for (p, s) in home_status_map.items()
+                    if s == "OUT" and (not hide_long_out or p not in (home_long_out or []))
+                ]
+
+                if home_out_names:
+                    st.markdown("**" + home_abbr + " OUT:** " + ", ".join(sorted(home_out_names)))
             else:
                 # Fallback: use minutes-based projected lineup
                 home_starters, home_bench = build_projected_lineup(
@@ -1929,9 +1937,6 @@ with tab_single:
             )
             if away_ctg_starters:
                 st.markdown(f"**{away_abbr} projected starters (CTG lineups)**")
-                st.caption(
-                    "Based on highest-possession 5-man lineup that does not include OUT players."
-                )
                 away_starters_df = prepare_lineup_df(
                     away_abbr, away_ctg_starters, away_long_out if hide_long_out else None
                 )
@@ -1950,6 +1955,17 @@ with tab_single:
                     use_container_width=True,
                     hide_index=True,
                 )
+
+                away_status_map = team_status.get(away_abbr, {})
+
+                away_out_names = [
+                    p
+                    for (p, s) in away_status_map.items()
+                    if s == "OUT" and (not hide_long_out or p not in (away_long_out or []))
+                ]
+
+                if away_out_names:
+                    st.markdown("**" + away_abbr + " OUT:** " + ", ".join(sorted(away_out_names)))
             else:
                 away_starters, away_bench = build_projected_lineup(
                     team_abbr=away_abbr,
@@ -1961,13 +1977,8 @@ with tab_single:
                 )
                 render_projected_lineup(away_abbr, away_starters, away_bench)
 
-        st.caption(
-            "Status from RapidAPI injuries; MIN & Diff from CTG on/off. "
-            "Long-term outs hidden if that option is enabled above."
-        )
-
         apply_clicked = st.button(
-            "Apply Doubtful & Out players to selectors for this game"
+            "Apply Injuries"
         )
 
         if apply_clicked and injury_loaded:
