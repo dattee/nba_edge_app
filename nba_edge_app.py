@@ -451,6 +451,98 @@ def compute_player_injury_terms(out_players, players_df, injury_cap=6.0):
     return player_adj_raw, 0.0, "low", 0
 
 
+def build_projected_lineup(
+    team_abbr: str,
+    players_df: pd.DataFrame,
+    injury_lists: dict,
+    long_out_names: list[str] | None = None,
+    min_cutoff: float | None = None,
+):
+    """
+    Build a simple projected lineup for a team based on CTG MIN and injuries.
+
+    Returns
+    -------
+    starters_df : pd.DataFrame
+        Top 5 players by MIN (descending) among available players.
+    bench_df : pd.DataFrame
+        Remaining players (optionally filtered by min_cutoff).
+    """
+    team_df = players_df[players_df["Team"] == team_abbr].copy()
+    if team_df.empty:
+        return pd.DataFrame(columns=["Player", "Status", "MIN", "Diff"]), pd.DataFrame(
+            columns=["Player", "Status", "MIN", "Diff"]
+        )
+
+    # Normalize and keep only relevant columns
+    team_df = team_df[team_df["Player"].notna()].copy()
+    if "MIN" not in team_df.columns:
+        team_df["MIN"] = 0.0
+    if "Diff" not in team_df.columns:
+        team_df["Diff"] = 0.0
+
+    team_df["MIN"] = pd.to_numeric(team_df["MIN"], errors="coerce").fillna(0.0)
+    team_df["Diff"] = pd.to_numeric(team_df["Diff"], errors="coerce").fillna(0.0)
+
+    # Respect long-term-out hiding if provided
+    if long_out_names:
+        team_df = team_df[~team_df["Player"].isin(long_out_names)]
+
+    # Injury status from RapidAPI lists-style dict
+    inj_info = injury_lists.get(team_abbr, {"out": [], "q": [], "other": []})
+    out_set = set(inj_info.get("out", []))
+    q_set = set(inj_info.get("q", []))
+
+    def player_status(name: str) -> str:
+        if name in out_set:
+            return "OUT"
+        if name in q_set:
+            return "Q"
+        return "OK"
+
+    team_df["Status"] = team_df["Player"].apply(player_status)
+
+    # Sort by minutes played
+    team_df = team_df.sort_values("MIN", ascending=False)
+
+    # Optional deep-bench filter
+    if min_cutoff is not None:
+        team_df = team_df[team_df["MIN"] >= min_cutoff]
+
+    # Top 5 -> starters, rest -> bench
+    starters_df = team_df.head(5).copy()
+    bench_df = team_df.iloc[5:].copy()
+
+    # Only show minimal columns in UI
+    starters_df = starters_df[["Player", "Status", "MIN", "Diff"]]
+    bench_df = bench_df[["Player", "Status", "MIN", "Diff"]]
+
+    return starters_df, bench_df
+
+
+def render_projected_lineup(team_abbr: str, starters_df: pd.DataFrame, bench_df: pd.DataFrame):
+    """Render projected starters + bench for a team."""
+    st.markdown(f"**{team_abbr} projected starters (by MIN)**")
+    if starters_df.empty:
+        st.caption("No data available.")
+    else:
+        st.dataframe(
+            starters_df.reset_index(drop=True),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown(f"**{team_abbr} bench**")
+    if bench_df.empty:
+        st.caption("No bench players (after filters).")
+    else:
+        st.dataframe(
+            bench_df.reset_index(drop=True),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
 def summarize_injury_magnitude(
     out_players,
     players_df: pd.DataFrame,
@@ -1521,123 +1613,6 @@ with tab_single:
         key="proj_dog_input",
     )
 
-    def get_projected_lineup(team_abbr: str, max_players: int = 12, max_days: int = 30):
-        """
-        Heuristic projected lineup for a team.
-
-        - Filters to players on this team in players_df.
-        - Keeps only reasonably recent players (DaysSinceLastGame <= max_days or NaN).
-        - Tries to identify rotation players using a minutes column if available.
-        - Sorts by:
-            1) Rotation flag (True first)
-            2) Minutes (descending) if available
-            3) Most recent game (DaysSinceLastGame ascending)
-            4) Impact (abs(Diff) descending) if Diff exists.
-        - Returns:
-            starters: first 5 players
-            bench: next players up to max_players total
-        """
-        team_df = players_df[players_df["Team"] == team_abbr].copy()
-
-        # Filter to somewhat recent players
-        if "DaysSinceLastGame" in team_df.columns:
-            recent_mask = (
-                team_df["DaysSinceLastGame"].isna()
-                | (team_df["DaysSinceLastGame"] <= max_days)
-            )
-            team_df = team_df[recent_mask]
-
-        if team_df.empty:
-            return [], []
-
-        # Try to find a minutes column
-        minutes_col = None
-        for col in ["MP", "Minutes", "MIN", "MinPerGame", "MinutesPerGame"]:
-            if col in team_df.columns:
-                minutes_col = col
-                break
-
-        # Rotation flag: guys who play real minutes
-        if minutes_col:
-            team_df["rotation_flag"] = team_df[minutes_col].fillna(0) >= 10  # 10+ mins
-        else:
-            team_df["rotation_flag"] = True
-
-        # Impact magnitude for tie-breaking
-        if "Diff" in team_df.columns:
-            team_df["abs_diff_for_sort"] = team_df["Diff"].abs()
-        else:
-            team_df["abs_diff_for_sort"] = 0.0
-
-        sort_cols = ["rotation_flag"]
-        ascending = [False]  # rotation players first
-
-        if minutes_col:
-            sort_cols.append(minutes_col)
-            ascending.append(False)  # more minutes first
-
-        if "DaysSinceLastGame" in team_df.columns:
-            sort_cols.append("DaysSinceLastGame")
-            ascending.append(True)  # more recent first
-
-        sort_cols.append("abs_diff_for_sort")
-        ascending.append(False)  # bigger impact first
-
-        team_df = team_df.sort_values(sort_cols, ascending=ascending)
-
-        players = team_df["Player"].dropna().tolist()
-        starters = players[:5]
-        bench = players[5:max_players]
-
-        return starters, bench
-
-    def render_projected_lineup(team_abbr: str, inj_info: dict, label: str):
-        """
-        Show a simple projected lineup card for one team.
-
-        inj_info is something like:
-            {'out': [...], 'q': [...], 'other': [...]}
-        """
-        # Get heuristic starters/bench from players_df
-        starters, bench = get_projected_lineup(team_abbr)
-
-        out_set = set(inj_info.get("out") or [])
-        q_set = set(inj_info.get("q") or [])
-
-        # Remove confirmed OUT players from the projected rotation
-        starters = [p for p in starters if p not in out_set]
-        bench = [p for p in bench if p not in out_set]
-
-        def status_tag(name: str) -> str:
-            if name in out_set:
-                return "OUT"
-            if name in q_set:
-                return "Q"
-            return ""
-
-        st.markdown(f"**{label} {team_abbr} – Projected lineup (v1)**")
-
-        if not starters and not bench:
-            st.caption("No recent players found for this team.")
-            return
-
-        st.caption("Starters (heuristic):")
-        for name in starters:
-            tag = status_tag(name)
-            if tag:
-                st.markdown(f"- {name}  · **{tag}**")
-            else:
-                st.markdown(f"- {name}")
-
-        if bench:
-            st.caption("Bench / others:")
-            for name in bench:
-                tag = status_tag(name)
-                if tag:
-                    st.markdown(f"- {name}  · **{tag}**")
-                else:
-                    st.markdown(f"- {name}")
-
     st.subheader("Player Availability (On/Off Impact)")
 
     col_filter1, col_filter2 = st.columns(2)
@@ -1687,6 +1662,35 @@ with tab_single:
     # Base player pools from your on/off data
     home_players, home_long_out = get_player_pool(home_abbr)
     away_players, away_long_out = get_player_pool(away_abbr)
+
+    # --- Projected lineups (CTG MIN + injuries) ---
+    with st.expander("Projected lineups (based on minutes & injuries)", expanded=False):
+        col_home_lineup, col_away_lineup = st.columns(2)
+
+        with col_home_lineup:
+            home_starters, home_bench = build_projected_lineup(
+                team_abbr=home_abbr,
+                players_df=players_df,
+                injury_lists=injury_lists,
+                long_out_names=home_long_out if hide_long_out else None,
+                min_cutoff=None,  # or e.g. 50.0 to hide deep bench
+            )
+            render_projected_lineup(home_abbr, home_starters, home_bench)
+
+        with col_away_lineup:
+            away_starters, away_bench = build_projected_lineup(
+                team_abbr=away_abbr,
+                players_df=players_df,
+                injury_lists=injury_lists,
+                long_out_names=away_long_out if hide_long_out else None,
+                min_cutoff=None,
+            )
+            render_projected_lineup(away_abbr, away_starters, away_bench)
+
+        st.caption(
+            "Status = OUT/Q from injury feed. MIN & Diff from CTG on/off. "
+            "Long-term outs hidden if that option is enabled above."
+        )
 
     # --- Auto injuries expander (RapidAPI) ---
 
@@ -1739,16 +1743,6 @@ with tab_single:
                 st.session_state[key] = away_out_names[i]
             else:
                 st.session_state[key] = "None"
-
-    # --- Projected lineup v1 (read-only helper) ---
-    with st.expander("Projected lineups (v1)", expanded=False):
-        col_pl_home, col_pl_away = st.columns(2)
-
-        with col_pl_home:
-            render_projected_lineup(home_abbr, home_inj, label="Home")
-
-        with col_pl_away:
-            render_projected_lineup(away_abbr, away_inj, label="Away")
 
     # Manual / final selection of out players (drives the model)
     home_out, away_out = [], []
