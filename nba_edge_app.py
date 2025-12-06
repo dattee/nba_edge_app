@@ -1,4 +1,5 @@
 import math
+from pathlib import Path
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -324,6 +325,38 @@ def load_injury_lists_for_today() -> dict:
         return {}
 
 
+@st.cache_data
+def load_ctg_lineups() -> pd.DataFrame:
+    """
+    Load CTG 5-man lineups (Four Factors) from CSV, if available.
+
+    Expected path:
+        CTG_onoff/ctg_lineups_four_factors.csv
+
+    Returns
+    -------
+    DataFrame with at least:
+        Team, PG, SG, SF, PF, C, Poss, Diff
+    """
+    base_dir = Path(__file__).resolve().parent
+    lineup_path = base_dir / "CTG_onoff" / "ctg_lineups_four_factors.csv"
+
+    if not lineup_path.exists():
+        print("[CTG] No lineups file found at", lineup_path)
+        return pd.DataFrame()
+
+    df = pd.read_csv(lineup_path)
+    # Drop League Averages row if present
+    df = df[df["Team"].astype(str) != "League Averages"].copy()
+
+    # Normalize
+    df["Team"] = df["Team"].astype(str).str.upper()
+    df["Poss"] = pd.to_numeric(df["Poss"], errors="coerce").fillna(0.0)
+    df["Diff"] = pd.to_numeric(df["Diff"], errors="coerce")
+
+    return df
+
+
 def get_team_power(team_abbr: str, is_home: bool) -> float | None:
     """
     Uses Team_ratings.csv
@@ -518,6 +551,62 @@ def build_projected_lineup(
     bench_df = bench_df[["Player", "Status", "MIN", "Diff"]]
 
     return starters_df, bench_df
+
+
+def select_ctg_projected_starters(
+    team_abbr: str,
+    players_df: pd.DataFrame,
+    injury_lists: dict,
+    lineups_df: pd.DataFrame,
+) -> list[str] | None:
+    """
+    Use CTG 5-man lineups to select projected starters for a team.
+
+    Logic:
+        - Filter lineups to the team.
+        - Exclude lineups that contain any OUT players from injury_lists.
+        - Sort by Poss descending.
+        - Return [PG, SG, SF, PF, C] for the best remaining lineup.
+
+    If no valid lineup is found, returns None.
+    """
+    if lineups_df is None or lineups_df.empty:
+        return None
+
+    team_lines = lineups_df[lineups_df["Team"] == team_abbr].copy()
+    if team_lines.empty:
+        return None
+
+    inj_info = injury_lists.get(team_abbr, {"out": [], "q": [], "other": []})
+    out_set = set(inj_info.get("out", []))
+
+    def lineup_has_out(row) -> bool:
+        players = [row.get("PG"), row.get("SG"), row.get("SF"), row.get("PF"), row.get("C")]
+        return any(p in out_set for p in players if isinstance(p, str))
+
+    # Filter out lineups containing OUT players
+    team_lines["has_out"] = team_lines.apply(lineup_has_out, axis=1)
+    valid = team_lines[team_lines["has_out"] == False]  # noqa: E712
+
+    # If everything is invalid, we can either return None or fall back to best lineup
+    if valid.empty:
+        # Fallback: take best lineup even if it includes OUT (we'll treat this as "healthy baseline")
+        valid = team_lines
+
+    valid = valid.sort_values("Poss", ascending=False)
+    top = valid.head(1)
+    if top.empty:
+        return None
+
+    row = top.iloc[0]
+    starters = [row.get("PG"), row.get("SG"), row.get("SF"), row.get("PF"), row.get("C")]
+    starters = [p for p in starters if isinstance(p, str) and p.strip()]
+
+    if not starters or len(starters) < 3:
+        # If for some reason we don't get a reasonable lineup, bail out
+        return None
+
+    return starters
 
 
 def render_projected_lineup(team_abbr: str, starters_df: pd.DataFrame, bench_df: pd.DataFrame):
@@ -1663,29 +1752,139 @@ with tab_single:
     home_players, home_long_out = get_player_pool(home_abbr)
     away_players, away_long_out = get_player_pool(away_abbr)
 
+    # --- Load CTG lineups once ---
+    ctg_lineups = load_ctg_lineups()
+
     # --- Projected lineups (CTG MIN + injuries) ---
-    with st.expander("Projected lineups (based on minutes & injuries)", expanded=False):
+    with st.expander(
+        "Projected lineups (based on CTG lineups, minutes & injuries)", expanded=False
+    ):
         col_home_lineup, col_away_lineup = st.columns(2)
 
         with col_home_lineup:
-            home_starters, home_bench = build_projected_lineup(
+            # Try CTG-based starters first
+            home_ctg_starters = select_ctg_projected_starters(
                 team_abbr=home_abbr,
                 players_df=players_df,
                 injury_lists=injury_lists,
-                long_out_names=home_long_out if hide_long_out else None,
-                min_cutoff=None,  # or e.g. 50.0 to hide deep bench
+                lineups_df=ctg_lineups,
             )
-            render_projected_lineup(home_abbr, home_starters, home_bench)
+
+            if home_ctg_starters:
+                st.markdown(f"**{home_abbr} projected starters (CTG lineups)**")
+                st.caption(
+                    "Based on highest-possession 5-man lineup that does not include OUT players."
+                )
+                # Build a small DF using CTG starters, and look up MIN/Diff from players_df
+                home_starters_df = (
+                    players_df[
+                        (players_df["Team"] == home_abbr)
+                        & (players_df["Player"].isin(home_ctg_starters))
+                    ]
+                    .copy()
+                )
+                if "MIN" not in home_starters_df.columns:
+                    home_starters_df["MIN"] = 0.0
+                if "Diff" not in home_starters_df.columns:
+                    home_starters_df["Diff"] = 0.0
+
+                home_starters_df = home_starters_df[["Player", "MIN", "Diff"]].sort_values(
+                    "MIN", ascending=False
+                )
+                st.dataframe(
+                    home_starters_df.reset_index(drop=True),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                # Bench = rest of roster minus starters, sorted by MIN
+                home_bench_df = players_df[
+                    (players_df["Team"] == home_abbr)
+                    & (~players_df["Player"].isin(home_ctg_starters))
+                ].copy()
+                if "MIN" not in home_bench_df.columns:
+                    home_bench_df["MIN"] = 0.0
+                if "Diff" not in home_bench_df.columns:
+                    home_bench_df["Diff"] = 0.0
+                home_bench_df = home_bench_df[["Player", "MIN", "Diff"]].sort_values(
+                    "MIN", ascending=False
+                )
+                st.markdown(f"**{home_abbr} bench (by MIN)**")
+                st.dataframe(
+                    home_bench_df.reset_index(drop=True),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                # Fallback: use minutes-based projected lineup
+                home_starters, home_bench = build_projected_lineup(
+                    team_abbr=home_abbr,
+                    players_df=players_df,
+                    injury_lists=injury_lists,
+                    long_out_names=home_long_out if hide_long_out else None,
+                    min_cutoff=None,  # or e.g. 50.0 to hide deep bench
+                )
+                render_projected_lineup(home_abbr, home_starters, home_bench)
 
         with col_away_lineup:
-            away_starters, away_bench = build_projected_lineup(
+            away_ctg_starters = select_ctg_projected_starters(
                 team_abbr=away_abbr,
                 players_df=players_df,
                 injury_lists=injury_lists,
-                long_out_names=away_long_out if hide_long_out else None,
-                min_cutoff=None,
+                lineups_df=ctg_lineups,
             )
-            render_projected_lineup(away_abbr, away_starters, away_bench)
+            if away_ctg_starters:
+                st.markdown(f"**{away_abbr} projected starters (CTG lineups)**")
+                st.caption(
+                    "Based on highest-possession 5-man lineup that does not include OUT players."
+                )
+                away_starters_df = (
+                    players_df[
+                        (players_df["Team"] == away_abbr)
+                        & (players_df["Player"].isin(away_ctg_starters))
+                    ]
+                    .copy()
+                )
+                if "MIN" not in away_starters_df.columns:
+                    away_starters_df["MIN"] = 0.0
+                if "Diff" not in away_starters_df.columns:
+                    away_starters_df["Diff"] = 0.0
+
+                away_starters_df = away_starters_df[["Player", "MIN", "Diff"]].sort_values(
+                    "MIN", ascending=False
+                )
+                st.dataframe(
+                    away_starters_df.reset_index(drop=True),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                away_bench_df = players_df[
+                    (players_df["Team"] == away_abbr)
+                    & (~players_df["Player"].isin(away_ctg_starters))
+                ].copy()
+                if "MIN" not in away_bench_df.columns:
+                    away_bench_df["MIN"] = 0.0
+                if "Diff" not in away_bench_df.columns:
+                    away_bench_df["Diff"] = 0.0
+                away_bench_df = away_bench_df[["Player", "MIN", "Diff"]].sort_values(
+                    "MIN", ascending=False
+                )
+                st.markdown(f"**{away_abbr} bench (by MIN)**")
+                st.dataframe(
+                    away_bench_df.reset_index(drop=True),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                away_starters, away_bench = build_projected_lineup(
+                    team_abbr=away_abbr,
+                    players_df=players_df,
+                    injury_lists=injury_lists,
+                    long_out_names=away_long_out if hide_long_out else None,
+                    min_cutoff=None,
+                )
+                render_projected_lineup(away_abbr, away_starters, away_bench)
 
         st.caption(
             "Status = OUT/Q from injury feed. MIN & Diff from CTG on/off. "
