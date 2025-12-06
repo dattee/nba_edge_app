@@ -74,8 +74,8 @@ def normalize_injury_status(raw_status: str) -> str:
 
     s = str(raw_status).strip().lower()
 
-    if "out" in s:
-        # 'Out', 'Out (personal)', etc.
+    if "out" in s or "will not play" in s or "inactive" in s:
+        # 'Out', 'Out (personal)', 'will not play', etc.
         return "OUT"
     if "doubt" in s:
         return "DOUBTFUL"

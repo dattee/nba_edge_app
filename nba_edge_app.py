@@ -1955,17 +1955,6 @@ with tab_single:
                     use_container_width=True,
                     hide_index=True,
                 )
-
-                away_status_map = team_status.get(away_abbr, {})
-
-                away_out_names = [
-                    p
-                    for (p, s) in away_status_map.items()
-                    if s == "OUT" and (not hide_long_out or p not in (away_long_out or []))
-                ]
-
-                if away_out_names:
-                    st.markdown("**" + away_abbr + " OUT:** " + ", ".join(sorted(away_out_names)))
             else:
                 away_starters, away_bench = build_projected_lineup(
                     team_abbr=away_abbr,
@@ -1976,6 +1965,17 @@ with tab_single:
                     min_cutoff=None,
                 )
                 render_projected_lineup(away_abbr, away_starters, away_bench)
+
+            away_status_map = team_status.get(away_abbr, {})
+
+            away_out_names = [
+                p
+                for (p, s) in away_status_map.items()
+                if s == "OUT" and (not hide_long_out or p not in (away_long_out or []))
+            ]
+
+            if away_out_names:
+                st.markdown("**" + away_abbr + " OUT:** " + ", ".join(sorted(away_out_names)))
 
         apply_clicked = st.button(
             "Apply Injuries"
