@@ -64,6 +64,30 @@ TEAM_NAME_TO_ABBR: Dict[str, str] = {
 }
 
 
+def normalize_injury_status(raw_status: str) -> str:
+    """
+    Map raw injury 'status' from API to one of:
+        IN, PROBABLE, QUESTIONABLE, DOUBTFUL, OUT
+    """
+    if not raw_status:
+        return "IN"
+
+    s = str(raw_status).strip().lower()
+
+    if "out" in s:
+        # 'Out', 'Out (personal)', etc.
+        return "OUT"
+    if "doubt" in s:
+        return "DOUBTFUL"
+    if "quest" in s:
+        return "QUESTIONABLE"
+    if "prob" in s:
+        return "PROBABLE"
+
+    # 'Available', 'Active', anything else -> treat as playing
+    return "IN"
+
+
 def fetch_injuries_for_date(d: date) -> List[dict]:
     """
     Raw call to the RapidAPI endpoint for a specific date.
@@ -86,19 +110,61 @@ def fetch_injuries_for_date(d: date) -> List[dict]:
     return data.get("data") or data.get("results") or data.get("response") or []
 
 
-def _classify_status(status: str) -> str:
+def build_injury_lists_and_status_for_date(
+    d: date,
+) -> tuple[Dict[str, Dict[str, List[str]]], Dict[str, Dict[str, str]]]:
     """
-    Map API 'status' into logical buckets:
-        OUT, Q (questionable/doubtful/probable), OTHER
+    Build both the legacy list-style dict and a detailed status map for a date.
+
+    Returns
+    -------
+    team_lists : {abbr: {"out": [...], "q": [...], "other": [...]}}
+    team_status : {abbr: {player: normalized_status}}
     """
-    s = (status or "").lower()
-    if "out" in s:
-        return "OUT"
-    if "doubtful" in s or "questionable" in s or "probable" in s:
-        return "Q"
-    if "available" in s:
-        return "OTHER"
-    return "OTHER"
+    raw = fetch_injuries_for_date(d)
+
+    team_lists: Dict[str, Dict[str, List[str]]] = {}
+    team_status: Dict[str, Dict[str, str]] = {}
+
+    for item in raw:
+        team_full = item.get("team")
+        player = item.get("player")
+        status = item.get("status")
+
+        if not team_full or not player:
+            continue
+
+        abbr = TEAM_NAME_TO_ABBR.get(team_full)
+        if not abbr:
+            # Unknown team name; skip
+            continue
+
+        norm = normalize_injury_status(status)
+
+        bucket = "OTHER"
+        if norm == "OUT":
+            bucket = "OUT"
+        elif norm in {"DOUBTFUL", "QUESTIONABLE", "PROBABLE"}:
+            bucket = "Q"
+
+        lists_dict = team_lists.setdefault(abbr, {"out": [], "q": [], "other": []})
+
+        if bucket == "OUT":
+            lists_dict["out"].append(player)
+        elif bucket == "Q":
+            lists_dict["q"].append(player)
+        else:
+            lists_dict["other"].append(player)
+
+        status_map = team_status.setdefault(abbr, {})
+        status_map[player] = norm
+
+    # De-duplicate + sort for list-style output
+    for abbr, info in team_lists.items():
+        for key in ("out", "q", "other"):
+            info[key] = sorted(set(info[key]))
+
+    return team_lists, team_status
 
 
 def build_team_injury_lists_for_date(d: date) -> Dict[str, Dict[str, List[str]]]:
@@ -114,36 +180,11 @@ def build_team_injury_lists_for_date(d: date) -> Dict[str, Dict[str, List[str]]]
     This structure matches what the app previously used for the
     Basketball-Reference scraper.
     """
-    raw = fetch_injuries_for_date(d)
-
-    team_lists: Dict[str, Dict[str, List[str]]] = {}
-
-    for item in raw:
-        team_full = item.get("team")
-        player = item.get("player")
-        status = item.get("status")
-
-        if not team_full or not player:
-            continue
-
-        abbr = TEAM_NAME_TO_ABBR.get(team_full)
-        if not abbr:
-            # Unknown team name; skip
-            continue
-
-        bucket = _classify_status(status)
-        dct = team_lists.setdefault(abbr, {"out": [], "q": [], "other": []})
-
-        if bucket == "OUT":
-            dct["out"].append(player)
-        elif bucket == "Q":
-            dct["q"].append(player)
-        else:
-            dct["other"].append(player)
-
-    # De-duplicate + sort
-    for abbr, info in team_lists.items():
-        for key in ("out", "q", "other"):
-            info[key] = sorted(set(info[key]))
-
+    team_lists, _ = build_injury_lists_and_status_for_date(d)
     return team_lists
+
+
+def build_team_status_for_date(d: date) -> Dict[str, Dict[str, str]]:
+    """Return team -> player -> normalized status map for the given date."""
+    _, team_status = build_injury_lists_and_status_for_date(d)
+    return team_status

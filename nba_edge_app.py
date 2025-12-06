@@ -16,10 +16,16 @@ from openai import OpenAI
 
 # ---- RapidAPI NBA injuries (primary source) ----
 HAS_RAPID_INJURIES = False
+build_injury_lists_and_status_for_date = None
 build_team_injury_lists_for_date = None
+build_team_status_for_date = None
 
 try:
-    from rapidapi_injuries_client import build_team_injury_lists_for_date
+    from rapidapi_injuries_client import (
+        build_injury_lists_and_status_for_date,
+        build_team_injury_lists_for_date,
+        build_team_status_for_date,
+    )
     HAS_RAPID_INJURIES = True
     print("[INJ] Using RapidAPI NBA Injuries Reports client.")
 except Exception as e:
@@ -57,6 +63,14 @@ W_PLAYER = 0.2     # player on/off adjustment
 # How long a player can be out before we treat them as "baseline absent"
 # and stop showing them in the Out dropdown
 MAX_DAYS_ABSENT = 21  # you can tweak this later
+
+STATUS_LABELS = {
+    "IN": "In (100%)",
+    "PROBABLE": "Probable (~90% in)",
+    "QUESTIONABLE": "Questionable (~50% in)",
+    "DOUBTFUL": "Doubtful (~90% out)",
+    "OUT": "Out (100%)",
+}
 
 # Pace weights (small so they nudge rather than dominate)
 PACE_DELTA_WEIGHT = 0.06   # fav pace - dog pace
@@ -303,26 +317,29 @@ else:
 
 
 @st.cache_data(ttl=300)  # cache for 5 minutes
-def load_injury_lists_for_today() -> dict:
+def load_injury_lists_for_today() -> tuple[dict, dict]:
     """
-    Load injury lists for today from RapidAPI.
+    Load injury lists + normalized status map for today from RapidAPI.
 
     Returns:
-        { 'MIA': {'out': [...], 'q': [...], 'other': [...]}, ... }
+        (
+            { 'MIA': {'out': [...], 'q': [...], 'other': [...]}, ... },
+            { 'MIA': { 'Player Name': 'QUESTIONABLE', ... }, ... },
+        )
     """
-    if not HAS_RAPID_INJURIES or build_team_injury_lists_for_date is None:
+    if not HAS_RAPID_INJURIES or build_injury_lists_and_status_for_date is None:
         print("[INJ] RapidAPI client not available.")
-        return {}
+        return {}, {}
 
     today = date.today()
 
     try:
-        data = build_team_injury_lists_for_date(today)
-        print(f"[INJ] Loaded RapidAPI injuries for {len(data)} teams")
-        return data
+        lists, status_map = build_injury_lists_and_status_for_date(today)
+        print(f"[INJ] Loaded RapidAPI injuries for {len(lists)} teams")
+        return lists, status_map
     except Exception as e:
         print("[INJ] RapidAPI injuries failed:", e)
-        return {}
+        return {}, {}
 
 
 @st.cache_data
@@ -484,10 +501,25 @@ def compute_player_injury_terms(out_players, players_df, injury_cap=6.0):
     return player_adj_raw, 0.0, "low", 0
 
 
+def add_status_column(df: pd.DataFrame, team_abbr: str, team_status: dict) -> pd.DataFrame:
+    """Attach normalized status labels to a player DataFrame."""
+
+    status_map = team_status.get(team_abbr, {}) if team_status else {}
+
+    def label(name: str) -> str:
+        norm = status_map.get(name, "IN")
+        return STATUS_LABELS.get(norm, STATUS_LABELS["IN"])
+
+    out_df = df.copy()
+    out_df["Status"] = out_df["Player"].apply(label)
+    return out_df[["Player", "Status", "MIN", "Diff"]]
+
+
 def build_projected_lineup(
     team_abbr: str,
     players_df: pd.DataFrame,
     injury_lists: dict,
+    team_status: dict | None = None,
     long_out_names: list[str] | None = None,
     min_cutoff: float | None = None,
 ):
@@ -521,20 +553,6 @@ def build_projected_lineup(
     if long_out_names:
         team_df = team_df[~team_df["Player"].isin(long_out_names)]
 
-    # Injury status from RapidAPI lists-style dict
-    inj_info = injury_lists.get(team_abbr, {"out": [], "q": [], "other": []})
-    out_set = set(inj_info.get("out", []))
-    q_set = set(inj_info.get("q", []))
-
-    def player_status(name: str) -> str:
-        if name in out_set:
-            return "OUT"
-        if name in q_set:
-            return "Q"
-        return "OK"
-
-    team_df["Status"] = team_df["Player"].apply(player_status)
-
     # Sort by minutes played
     team_df = team_df.sort_values("MIN", ascending=False)
 
@@ -547,8 +565,11 @@ def build_projected_lineup(
     bench_df = team_df.iloc[5:].copy()
 
     # Only show minimal columns in UI
-    starters_df = starters_df[["Player", "Status", "MIN", "Diff"]]
-    bench_df = bench_df[["Player", "Status", "MIN", "Diff"]]
+    starters_df = starters_df[["Player", "MIN", "Diff"]]
+    bench_df = bench_df[["Player", "MIN", "Diff"]]
+
+    starters_df = add_status_column(starters_df, team_abbr, team_status or {})
+    bench_df = add_status_column(bench_df, team_abbr, team_status or {})
 
     return starters_df, bench_df
 
@@ -558,6 +579,7 @@ def select_ctg_projected_starters(
     players_df: pd.DataFrame,
     injury_lists: dict,
     lineups_df: pd.DataFrame,
+    long_out_names: list[str] | None = None,
 ) -> list[str] | None:
     """
     Use CTG 5-man lineups to select projected starters for a team.
@@ -579,10 +601,13 @@ def select_ctg_projected_starters(
 
     inj_info = injury_lists.get(team_abbr, {"out": [], "q": [], "other": []})
     out_set = set(inj_info.get("out", []))
+    long_out_set = set(long_out_names or [])
 
     def lineup_has_out(row) -> bool:
         players = [row.get("PG"), row.get("SG"), row.get("SF"), row.get("PF"), row.get("C")]
-        return any(p in out_set for p in players if isinstance(p, str))
+        return any(
+            p in out_set or p in long_out_set for p in players if isinstance(p, str)
+        )
 
     # Filter out lineups containing OUT players
     team_lines["has_out"] = team_lines.apply(lineup_has_out, axis=1)
@@ -631,6 +656,27 @@ def render_projected_lineup(team_abbr: str, starters_df: pd.DataFrame, bench_df:
             hide_index=True,
         )
 
+
+def auto_apply_out_players(
+    team_abbr: str,
+    side_label: str,
+    team_status: dict,
+    long_out_names: list[str] | None,
+    dropdown_options: list[str],
+    hide_long_out: bool,
+):
+    status_map = team_status.get(team_abbr, {}) if team_status else {}
+    candidates = [p for (p, s) in status_map.items() if s in {"DOUBTFUL", "OUT"}]
+
+    if hide_long_out and long_out_names:
+        candidates = [p for p in candidates if p not in long_out_names]
+
+    candidates = [p for p in candidates if p in dropdown_options]
+
+    for i in range(1, 6):
+        key = f"{side_label}_out_player_{i}"
+        if i <= len(candidates):
+            st.session_state[key] = candidates[i - 1]
 
 def summarize_injury_magnitude(
     out_players,
@@ -1725,7 +1771,7 @@ with tab_single:
             load_injury_lists_for_today.clear()
             st.success("Injuries reloaded from API.")
 
-    injury_lists = load_injury_lists_for_today()
+    injury_lists, team_status = load_injury_lists_for_today()
     injury_loaded = bool(injury_lists)
     st.caption(f"Injury list loaded: {injury_loaded}")
 
@@ -1759,6 +1805,59 @@ with tab_single:
     with st.expander(
         "Projected lineups (based on CTG lineups, minutes & injuries)", expanded=False
     ):
+        def prepare_lineup_df(team_abbr: str, players_list: list[str], long_out_names):
+            players_list = [p for p in players_list if isinstance(p, str)]
+            base = players_df[
+                (players_df["Team"] == team_abbr)
+                & (players_df["Player"].isin(players_list))
+            ].copy()
+            if "MIN" not in base.columns:
+                base["MIN"] = 0.0
+            if "Diff" not in base.columns:
+                base["Diff"] = 0.0
+
+            missing = [p for p in players_list if p not in base["Player"].tolist()]
+            if missing:
+                extra_rows = pd.DataFrame(
+                    {
+                        "Player": missing,
+                        "Team": team_abbr,
+                        "MIN": 0.0,
+                        "Diff": 0.0,
+                    }
+                )
+                base = pd.concat([base, extra_rows], ignore_index=True)
+
+            if hide_long_out and long_out_names:
+                base = base[~base["Player"].isin(long_out_names)]
+
+            base["MIN"] = pd.to_numeric(base["MIN"], errors="coerce").fillna(0.0)
+            base["Diff"] = pd.to_numeric(base["Diff"], errors="coerce").fillna(0.0)
+
+            base = base[["Player", "MIN", "Diff"]]
+            base = add_status_column(base, team_abbr, team_status)
+            return base.sort_values("MIN", ascending=False)
+
+        def prepare_bench_df(team_abbr: str, starters_list: list[str], long_out_names):
+            bench_df = players_df[
+                (players_df["Team"] == team_abbr)
+                & (~players_df["Player"].isin(starters_list))
+            ].copy()
+            if "MIN" not in bench_df.columns:
+                bench_df["MIN"] = 0.0
+            if "Diff" not in bench_df.columns:
+                bench_df["Diff"] = 0.0
+
+            if hide_long_out and long_out_names:
+                bench_df = bench_df[~bench_df["Player"].isin(long_out_names)]
+
+            bench_df["MIN"] = pd.to_numeric(bench_df["MIN"], errors="coerce").fillna(0.0)
+            bench_df["Diff"] = pd.to_numeric(bench_df["Diff"], errors="coerce").fillna(0.0)
+
+            bench_df = bench_df[["Player", "MIN", "Diff"]]
+            bench_df = add_status_column(bench_df, team_abbr, team_status)
+            return bench_df.sort_values("MIN", ascending=False)
+
         col_home_lineup, col_away_lineup = st.columns(2)
 
         with col_home_lineup:
@@ -1768,6 +1867,7 @@ with tab_single:
                 players_df=players_df,
                 injury_lists=injury_lists,
                 lineups_df=ctg_lineups,
+                long_out_names=home_long_out if hide_long_out else None,
             )
 
             if home_ctg_starters:
@@ -1775,42 +1875,8 @@ with tab_single:
                 st.caption(
                     "Based on highest-possession 5-man lineup that does not include OUT players."
                 )
-                inj_info = injury_lists.get(home_abbr, {"out": [], "q": [], "other": []})
-                out_set = set(inj_info.get("out", []))
-                q_set = set(inj_info.get("q", []))
-
-                def player_status(name: str) -> str:
-                    if name in out_set:
-                        return "OUT"
-                    if name in q_set:
-                        return "Q"
-                    return "OK"
-
-                players_list = home_ctg_starters
-                base = players_df[
-                    (players_df["Team"] == home_abbr)
-                    & (players_df["Player"].isin(players_list))
-                ].copy()
-                if "MIN" not in base.columns:
-                    base["MIN"] = 0.0
-                if "Diff" not in base.columns:
-                    base["Diff"] = 0.0
-
-                missing = [p for p in players_list if p not in base["Player"].tolist()]
-                if missing:
-                    extra_rows = pd.DataFrame(
-                        {
-                            "Player": missing,
-                            "Team": home_abbr,
-                            "MIN": 0.0,
-                            "Diff": 0.0,
-                        }
-                    )
-                    base = pd.concat([base, extra_rows], ignore_index=True)
-
-                base["Status"] = base["Player"].apply(player_status)
-                home_starters_df = base[["Player", "Status", "MIN", "Diff"]].sort_values(
-                    "MIN", ascending=False
+                home_starters_df = prepare_lineup_df(
+                    home_abbr, home_ctg_starters, home_long_out if hide_long_out else None
                 )
                 st.dataframe(
                     home_starters_df.reset_index(drop=True),
@@ -1819,17 +1885,8 @@ with tab_single:
                 )
 
                 # Bench = rest of roster minus starters, sorted by MIN
-                home_bench_df = players_df[
-                    (players_df["Team"] == home_abbr)
-                    & (~players_df["Player"].isin(home_ctg_starters))
-                ].copy()
-                if "MIN" not in home_bench_df.columns:
-                    home_bench_df["MIN"] = 0.0
-                if "Diff" not in home_bench_df.columns:
-                    home_bench_df["Diff"] = 0.0
-                home_bench_df["Status"] = home_bench_df["Player"].apply(player_status)
-                home_bench_df = home_bench_df[["Player", "Status", "MIN", "Diff"]].sort_values(
-                    "MIN", ascending=False
+                home_bench_df = prepare_bench_df(
+                    home_abbr, home_ctg_starters, home_long_out if hide_long_out else None
                 )
                 st.markdown(f"**{home_abbr} bench (by MIN)**")
                 st.dataframe(
@@ -1843,6 +1900,7 @@ with tab_single:
                     team_abbr=home_abbr,
                     players_df=players_df,
                     injury_lists=injury_lists,
+                    team_status=team_status,
                     long_out_names=home_long_out if hide_long_out else None,
                     min_cutoff=None,  # or e.g. 50.0 to hide deep bench
                 )
@@ -1854,48 +1912,15 @@ with tab_single:
                 players_df=players_df,
                 injury_lists=injury_lists,
                 lineups_df=ctg_lineups,
+                long_out_names=away_long_out if hide_long_out else None,
             )
             if away_ctg_starters:
                 st.markdown(f"**{away_abbr} projected starters (CTG lineups)**")
                 st.caption(
                     "Based on highest-possession 5-man lineup that does not include OUT players."
                 )
-                inj_info = injury_lists.get(away_abbr, {"out": [], "q": [], "other": []})
-                out_set = set(inj_info.get("out", []))
-                q_set = set(inj_info.get("q", []))
-
-                def player_status(name: str) -> str:
-                    if name in out_set:
-                        return "OUT"
-                    if name in q_set:
-                        return "Q"
-                    return "OK"
-
-                players_list = away_ctg_starters
-                base = players_df[
-                    (players_df["Team"] == away_abbr)
-                    & (players_df["Player"].isin(players_list))
-                ].copy()
-                if "MIN" not in base.columns:
-                    base["MIN"] = 0.0
-                if "Diff" not in base.columns:
-                    base["Diff"] = 0.0
-
-                missing = [p for p in players_list if p not in base["Player"].tolist()]
-                if missing:
-                    extra_rows = pd.DataFrame(
-                        {
-                            "Player": missing,
-                            "Team": away_abbr,
-                            "MIN": 0.0,
-                            "Diff": 0.0,
-                        }
-                    )
-                    base = pd.concat([base, extra_rows], ignore_index=True)
-
-                base["Status"] = base["Player"].apply(player_status)
-                away_starters_df = base[["Player", "Status", "MIN", "Diff"]].sort_values(
-                    "MIN", ascending=False
+                away_starters_df = prepare_lineup_df(
+                    away_abbr, away_ctg_starters, away_long_out if hide_long_out else None
                 )
                 st.dataframe(
                     away_starters_df.reset_index(drop=True),
@@ -1903,17 +1928,8 @@ with tab_single:
                     hide_index=True,
                 )
 
-                away_bench_df = players_df[
-                    (players_df["Team"] == away_abbr)
-                    & (~players_df["Player"].isin(away_ctg_starters))
-                ].copy()
-                if "MIN" not in away_bench_df.columns:
-                    away_bench_df["MIN"] = 0.0
-                if "Diff" not in away_bench_df.columns:
-                    away_bench_df["Diff"] = 0.0
-                away_bench_df["Status"] = away_bench_df["Player"].apply(player_status)
-                away_bench_df = away_bench_df[["Player", "Status", "MIN", "Diff"]].sort_values(
-                    "MIN", ascending=False
+                away_bench_df = prepare_bench_df(
+                    away_abbr, away_ctg_starters, away_long_out if hide_long_out else None
                 )
                 st.markdown(f"**{away_abbr} bench (by MIN)**")
                 st.dataframe(
@@ -1926,67 +1942,39 @@ with tab_single:
                     team_abbr=away_abbr,
                     players_df=players_df,
                     injury_lists=injury_lists,
+                    team_status=team_status,
                     long_out_names=away_long_out if hide_long_out else None,
                     min_cutoff=None,
                 )
                 render_projected_lineup(away_abbr, away_starters, away_bench)
 
         st.caption(
-            "Status = OUT/Q from injury feed. MIN & Diff from CTG on/off. "
+            "Status from RapidAPI injuries; MIN & Diff from CTG on/off. "
             "Long-term outs hidden if that option is enabled above."
         )
 
-    # --- Auto injuries expander (RapidAPI) ---
-
-    def format_injury_block(label: str, info: dict):
-        outs = info.get("out", []) or []
-        qs = info.get("q", []) or []
-        other = info.get("other", []) or []
-
-        st.markdown(f"**{label}**")
-        st.markdown("**Out:** " + (", ".join(outs) if outs else "_None_"))
-        st.markdown(
-            "**Questionable / Doubtful / Probable:** "
-            + (", ".join(qs) if qs else "_None_")
+        apply_clicked = st.button(
+            "Apply Doubtful & Out players to selectors for this game"
         )
-        if other:
-            st.markdown("**Other statuses:** " + ", ".join(other))
-        st.markdown("---")
 
-    apply_auto = False
-    if injury_loaded:
-        with st.expander(
-            "Auto injuries from NBA Injury Reports (RapidAPI)", expanded=False
-        ):
-            format_injury_block(home_abbr, home_inj)
-            format_injury_block(away_abbr, away_inj)
-
-            apply_auto = st.button(
-                "Apply 'Out' lists above to selectors for this game",
-                key="apply_rapid_out_lists",
+        if apply_clicked and injury_loaded:
+            auto_apply_out_players(
+                home_abbr,
+                side_label="home",
+                team_status=team_status,
+                long_out_names=home_long_out if hide_long_out else [],
+                dropdown_options=home_players,
+                hide_long_out=hide_long_out,
             )
-
-    # If user clicked "Apply" we want to pre-fill the out-selectors
-    if apply_auto and injury_loaded:
-        # Only use players who are actually in the current player pool
-        home_out_names = [p for p in home_inj.get("out", []) if p in home_players]
-        away_out_names = [p for p in away_inj.get("out", []) if p in away_players]
-
-        # Fill home_out_0..4 in order, skipping blanks
-        for i in range(5):
-            key = f"home_out_{i}"
-            if i < len(home_out_names):
-                st.session_state[key] = home_out_names[i]
-            else:
-                st.session_state[key] = "None"
-
-        # Fill away_out_0..4 in order
-        for i in range(5):
-            key = f"away_out_{i}"
-            if i < len(away_out_names):
-                st.session_state[key] = away_out_names[i]
-            else:
-                st.session_state[key] = "None"
+            auto_apply_out_players(
+                away_abbr,
+                side_label="away",
+                team_status=team_status,
+                long_out_names=away_long_out if hide_long_out else [],
+                dropdown_options=away_players,
+                hide_long_out=hide_long_out,
+            )
+            st.success("Applied Doubtful & Out players to injury selectors.")
 
     # Manual / final selection of out players (drives the model)
     home_out, away_out = [], []
@@ -1994,11 +1982,11 @@ with tab_single:
 
     with colH:
         st.markdown(f"**Home Out: {home_abbr}**")
-        for i in range(5):
+        for i in range(1, 6):
             choice = st.selectbox(
-                f"Out Player {i+1}",
+                f"Out Player {i}",
                 ["None"] + home_players,
-                key=f"home_out_{i}",
+                key=f"home_out_player_{i}",
             )
             if choice != "None":
                 home_out.append(choice)
@@ -2011,11 +1999,11 @@ with tab_single:
 
     with colA2:
         st.markdown(f"**Away Out: {away_abbr}**")
-        for i in range(5):
+        for i in range(1, 6):
             choice = st.selectbox(
-                f"Out Player {i+1}",
+                f"Out Player {i}",
                 ["None"] + away_players,
-                key=f"away_out_{i}",
+                key=f"away_out_player_{i}",
             )
             if choice != "None":
                 away_out.append(choice)
