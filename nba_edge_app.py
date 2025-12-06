@@ -36,7 +36,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # CONFIG
 # =========================
 DB_NAME = os.getenv("NBA_EDGE_DB_PATH", "model_logs.db")
-st.sidebar.caption(f"DB in use: {os.path.abspath(DB_NAME)}")
+#st.sidebar.caption(f"DB in use: {os.path.abspath(DB_NAME)}")
 
 ODDS_API_KEY = "fec9f6305dd7a9785e5f261c03c885d7"
 ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
@@ -1648,7 +1648,7 @@ with tab_single:
             "Max days since last game to show",
             min_value=1,
             max_value=90,
-            value=21,
+            value=14,
             step=1,
         )
 

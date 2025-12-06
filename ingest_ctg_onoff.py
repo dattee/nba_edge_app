@@ -18,11 +18,14 @@ It must contain at least the columns:
 Behavior:
     - Reads the CTG CSV.
     - Keeps only [Player, Team, Diff, MIN].
-    - Filters out players with MIN < MIN_MINUTES (to avoid tiny-sample noise).
-    - Loads existing players_onoff.csv if present.
-    - Overwrites Diff for any matching (Player, Team) from CTG.
-    - Preserves all other columns (DaysSinceLastGame, LastGameDate, etc.).
-    - Writes updated players_onoff.csv back to disk.
+    - (No minutes filter by default: we keep **all** CTG players.)
+    - If players_onoff.csv exists:
+        * Treat CTG as the base set of players.
+        * Outer-join old players_onoff on (Player, Team) to bring over
+          DaysSinceLastGame, LastGameDate, etc.
+        * Prefer CTG Diff and MIN when present.
+    - If players_onoff.csv does not exist:
+        * Create it from CTG data.
 """
 
 from __future__ import annotations
@@ -32,16 +35,13 @@ from pathlib import Path
 
 import pandas as pd
 
-# Minimum minutes to trust an on/off diff (tune as needed)
-MIN_MINUTES = 300
+# Set this to a number (e.g., 300) if you want to filter tiny minutes.
+# For "fully extract all players", we leave it as None (no filter).
+MIN_MINUTES = None
 
 
-def load_ctg_onoff(path: Path, min_minutes: int = MIN_MINUTES) -> pd.DataFrame:
-    """Load CTG on/off CSV and normalize to [Player, Team, Diff, MIN].
-
-    This version assumes the CTG file has columns:
-        Player, Age, Team, Pos, MIN, MPG, Diff Rank, Diff, ...
-    """
+def load_ctg_onoff(path: Path, min_minutes: int | None = MIN_MINUTES) -> pd.DataFrame:
+    """Load CTG on/off CSV and normalize to [Player, Team, Diff, MIN]."""
 
     df = pd.read_csv(path)
 
@@ -64,7 +64,7 @@ def load_ctg_onoff(path: Path, min_minutes: int = MIN_MINUTES) -> pd.DataFrame:
     # Drop rows with missing Diff or MIN
     df = df.dropna(subset=["Diff", "MIN"])
 
-    # Filter by minutes
+    # Filter by minutes if desired
     if min_minutes is not None:
         df = df[df["MIN"] >= min_minutes]
 
@@ -75,39 +75,63 @@ def load_ctg_onoff(path: Path, min_minutes: int = MIN_MINUTES) -> pd.DataFrame:
 
 
 def merge_ctg_into_players(players_path: Path, ctg_df: pd.DataFrame) -> pd.DataFrame:
-    """Merge CTG Diff into existing players_onoff.csv (if it exists).
+    """Merge CTG Diff into players_onoff.csv.
 
-    - If players_onoff.csv exists:
-        * Left-join CTG diffs on (Player, Team)
-        * Overwrite Diff with CTG's value when available
-        * Preserve all other columns (DaysSinceLastGame, etc.)
-    - If it does not exist:
-        * Build a new DataFrame with just Player, Team, Diff, MIN, LastUpdateDate.
+    Logic:
+        - CTG is the base. We want **all** CTG players in the final file.
+        - If players_onoff.csv exists:
+            * Outer-join CTG and old file on (Player, Team).
+            * Prefer CTG Diff and MIN when CTG has them.
+            * Preserve other columns from old file (DaysSinceLastGame, etc.)
+              when available.
+        - If it does not exist:
+            * Just use CTG data as the base.
     """
 
     if players_path.exists():
         old = pd.read_csv(players_path)
 
-        # Ensure Team columns are comparable
+        # Normalize Team in old file as well
         if "Team" in old.columns:
             old["Team"] = old["Team"].astype(str).str.upper()
 
-        merged = old.merge(
-            ctg_df[["Player", "Team", "Diff"]],
+        # Outer join: we want union of (Player, Team) from CTG and old
+        merged = pd.merge(
+            ctg_df,
+            old,
             on=["Player", "Team"],
-            how="left",
-            suffixes=("", "_ctg"),
+            how="outer",
+            suffixes=("_ctg", ""),
         )
 
-        # If CTG provides a Diff, prefer it; otherwise keep existing Diff
+        # Prefer CTG's Diff when it exists
         if "Diff_ctg" in merged.columns:
             if "Diff" in merged.columns:
                 merged["Diff"] = merged["Diff_ctg"].combine_first(merged["Diff"])
             else:
                 merged["Diff"] = merged["Diff_ctg"]
-            merged = merged.drop(columns=["Diff_ctg"])
+
+        # Prefer CTG's MIN when it exists
+        if "MIN_ctg" in merged.columns:
+            if "MIN" in merged.columns:
+                merged["MIN"] = merged["MIN_ctg"].combine_first(merged["MIN"])
+            else:
+                merged["MIN"] = merged["MIN_ctg"]
+
+        # Prefer CTG's LastUpdateDate when available
+        if "LastUpdateDate_ctg" in merged.columns:
+            if "LastUpdateDate" in merged.columns:
+                merged["LastUpdateDate"] = merged["LastUpdateDate_ctg"].combine_first(
+                    merged["LastUpdateDate"]
+                )
+            else:
+                merged["LastUpdateDate"] = merged["LastUpdateDate_ctg"]
+
+        # Drop CTG suffix columns we no longer need
+        drop_cols = [c for c in merged.columns if c.endswith("_ctg")]
+        merged = merged.drop(columns=drop_cols)
     else:
-        # No existing file -> use CTG data as the base
+        # No existing file -> CTG becomes the whole file
         merged = ctg_df.copy()
 
     return merged
