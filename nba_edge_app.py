@@ -553,6 +553,19 @@ def build_projected_lineup(
     if long_out_names:
         team_df = team_df[~team_df["Player"].isin(long_out_names)]
 
+    inj_info = injury_lists.get(team_abbr, {"out": [], "q": [], "other": []})
+    out_set = set(inj_info.get("out", []))
+    doubt_set = set(inj_info.get("doubtful", []))
+
+    status_map = team_status.get(team_abbr, {}) if team_status else {}
+    status_out = {p for p, status in status_map.items() if status in {"OUT", "DOUBTFUL"}}
+
+    blocked_players = out_set | doubt_set | status_out
+
+    # Drop OUT and DOUBTFUL players from the pool
+    if blocked_players:
+        team_df = team_df[~team_df["Player"].isin(blocked_players)]
+
     # Sort by minutes played
     team_df = team_df.sort_values("MIN", ascending=False)
 
@@ -613,10 +626,10 @@ def select_ctg_projected_starters(
     team_lines["has_out"] = team_lines.apply(lineup_has_out, axis=1)
     valid = team_lines[team_lines["has_out"] == False]  # noqa: E712
 
-    # If everything is invalid, we can either return None or fall back to best lineup
+    # If everything uses an OUT player, don't fall back to them.
+    # Return None so the caller can use the minutes-based helper instead.
     if valid.empty:
-        # Fallback: take best lineup even if it includes OUT (we'll treat this as "healthy baseline")
-        valid = team_lines
+        return None
 
     valid = valid.sort_values("Poss", ascending=False)
     top = valid.head(1)
